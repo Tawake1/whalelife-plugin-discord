@@ -1,0 +1,5 @@
+id: discord
+name: Discord
+description: 在 Discord 私信、指定频道和讨论串中与鲸鲸聊天
+version: 0.3.0
+apiVersion: "1"

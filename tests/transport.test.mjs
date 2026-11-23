@@ -74,13 +74,16 @@ const reference = { type: 0, message_id: other, channel_id: room };
 const original = { id: other, channel_id: room, author: { id: bot, username: '鲸鲸' }, content: '原句：天快亮了。' };
 const reply = { ...guild, type: 19, message_reference: reference, referenced_message: original };
 
-test('同一位置的引用保留原作者，群聊仍检查直接提及', () => {
+test('同一位置回复当前机器人可省略提及，其他引用仍需提及', () => {
   const result = incoming(reply, bot, config);
   assert.equal(result.sender, owner);
   assert.ok(result.text.includes(original.content));
   assert.ok(result.text.includes('"作者ID":"' + bot + '"'));
   assert.ok(result.text.endsWith('【当前发言】你好'));
-  assert.equal(incoming({ ...reply, content: '这句什么意思？' }, bot, config), undefined);
+  assert.ok(incoming({ ...reply, mentions:[], content:'这句什么意思？' }, bot, config));
+  for (const change of [{referenced_message:null},{referenced_message:{...original, author:{id:other}}},
+      {message_reference:{...reference,type:1}}, {message_reference:{...reference,channel_id:other}}])
+    assert.equal(incoming({...reply, ...change, mentions:[], content:'这句什么意思？'}, bot, config), undefined);
   assert.equal(incoming({ ...reply, channel_id: other }, bot, config), undefined);
   const dmReply = { ...dm, type: 19, message_reference: reference, referenced_message: original };
   assert.ok(incoming(dmReply, bot, config).text.includes(original.content));

@@ -4,9 +4,10 @@
 import { Client, GatewayIntentBits, Options } from 'discord.js';
 import { startPlugin } from './plugin.mjs';
 
-export function makeClient() {
+export function makeClient({ replyIntent = false } = {}) {
   return new Client({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.DirectMessages],
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.DirectMessages,
+      ...(replyIntent ? [GatewayIntentBits.MessageContent] : [])],
     makeCache: Options.cacheWithLimits({ ...Options.DefaultMakeCacheSettings, MessageManager: 0 }),
     rest: { retries: 0, timeout: 15000 },
     allowedMentions: { parse: [], repliedUser: false }

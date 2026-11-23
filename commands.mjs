@@ -3,7 +3,7 @@
  */
 import { ApplicationCommandOptionType, ApplicationCommandType, InteractionResponseType,
   InteractionType, MessageFlags, PermissionFlagsBits, Routes } from 'discord.js';
-import { snowflake } from './transport.mjs';
+import { allowedChannel, snowflake } from './transport.mjs';
 
 const subcommands = [
   ['status', '查看鲸鲸在当前位置的回应状态'],
@@ -35,7 +35,7 @@ export async function registerCommand(rest, account, signal) {
   return created.id;
 }
 
-export async function handleCommand(event, { rest, commandId, account, signal, serial, getConfig, savePaused }) {
+export async function handleCommand(event, { rest, commandId, account, signal, serial, getConfig, channelManager, savePaused }) {
   if (!commandId || event.type !== InteractionType.ApplicationCommand || event.application_id !== account ||
       event.data?.id !== commandId || event.data.type !== definition.type || event.data.name !== 'whale' ||
       !snowflake(event.id) || !event.token) return;
@@ -50,14 +50,14 @@ export async function handleCommand(event, { rest, commandId, account, signal, s
     signal.throwIfAborted();
     const channel = event.channel_id;
     const config = getConfig();
-    if (!snowflake(event.guild_id) || !snowflake(channel) || !config.channels.includes(channel))
+    if (!snowflake(event.guild_id) || !snowflake(channel) || !await allowedChannel(config, event.guild_id, channel, channelManager))
       return '此位置未在 WhaleLife 的允许频道列表中。';
     const option = event.data.options?.[0];
     if (event.data.options?.length !== 1 || option.type !== ApplicationCommandOptionType.Subcommand ||
         !subcommands.some(([name]) => name === option.name)) return '请重新选择 /whale 子命令。';
     const key = account + ':' + channel;
     const paused = config.pausedRoutes.includes(key);
-    if (option.name === 'status') return paused ? '鲸鲸已暂停回应当前位置的新消息。' : '鲸鲸会回应当前位置直接 @ 她的文字消息。';
+    if (option.name === 'status') return paused ? '鲸鲸已暂停回应当前位置的新消息。' : '鲸鲸会回应当前位置直接 @ 她或回复她的消息。';
     const permissions = event.member?.permissions;
     const required = PermissionFlagsBits.ManageChannels | PermissionFlagsBits.Administrator;
     if (!snowflake(event.member?.user?.id) || typeof permissions !== 'string' || !/^\d{1,24}$/.test(permissions) ||
@@ -68,7 +68,7 @@ export async function handleCommand(event, { rest, commandId, account, signal, s
       try { await savePaused(next); }
       catch { return '保存失败，请重试或在 WhaleLife 控制台检查插件。'; }
     }
-    return pause ? '已暂停当前位置的新消息。使用 /whale resume 恢复。' : '已恢复。直接 @鲸鲸 并附上文字即可聊天。';
+    return pause ? '已暂停当前位置的新消息。使用 /whale resume 恢复。' : '已恢复。直接 @鲸鲸 或回复她的消息即可聊天。';
   });
   if (result) await rest.patch(Routes.webhookMessage(account, event.token), {
     auth: false, signal, body: { content: result, allowed_mentions: { parse: [] } }

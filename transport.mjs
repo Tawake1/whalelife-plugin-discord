@@ -1,23 +1,43 @@
 /*! Copyright (c) 2026 WhaleLife Discord plugin contributors.
  * SPDX-License-Identifier: AGPL-3.0-only. See LICENSE-ADDITIONAL.
  */
+import { setTimeout as delay } from 'node:timers/promises';
 import { createHash } from 'node:crypto';
 
 export const snowflake = value => typeof value === 'string' && /^[1-9]\d{16,19}$/.test(value);
 
+function replySnapshot(data) {
+  const ref = data.message_reference;
+  const original = data.referenced_message;
+  if (data.type !== 19 || !ref || (ref.type !== undefined && ref.type !== 0) ||
+      !snowflake(ref.message_id) || original?.id !== ref.message_id || original.channel_id !== data.channel_id ||
+      (ref.channel_id !== undefined && ref.channel_id !== data.channel_id) ||
+      [ref, original].some(item => item.guild_id !== undefined && item.guild_id !== data.guild_id)) return;
+  return original;
+}
+
+export function addressesBot(data, botId) {
+  return replySnapshot(data)?.author?.id === botId ||
+    (data.mentions?.some(user => user.id === botId) && new RegExp('<@!?' + botId + '>').test(data.content));
+}
+
+export async function allowedChannel(config, guild, id, channels) {
+  if (!snowflake(guild) || !snowflake(id)) return false;
+  if (config.channels.includes(id)) return true;
+  if (!config.inheritThreads || !config.channels.length) return false;
+  try {
+    const channel = channels.cache.get(id) ?? await channels.fetch(id);
+    return channel?.id === id && channel.guildId === guild && channel.isThread() &&
+      config.channels.includes(channel.parentId);
+  } catch { return false; }
+}
+
 // Only the immediate reply snapshot delivered by Discord belongs to this turn.
 function replyText(data, question, botId) {
   if (data.type !== 19) return question;
-  const ref = data.message_reference;
-  const original = data.referenced_message;
+  const original = replySnapshot(data);
   const author = original?.author;
-  const sameLocation = location =>
-    (location.channel_id === undefined || location.channel_id === data.channel_id) &&
-    (location.guild_id === undefined || location.guild_id === data.guild_id);
-  const available = ref && (ref.type === undefined || ref.type === 0) && original &&
-    snowflake(ref.message_id) && original.id === ref.message_id &&
-    original.channel_id === data.channel_id && sameLocation(ref) && sameLocation(original) &&
-    snowflake(author?.id) && (data.guild_id || author.id === data.author.id || author.id === botId) &&
+  const available = snowflake(author?.id) && (data.guild_id || author.id === data.author.id || author.id === botId) &&
     typeof original.content === 'string' && original.content.trim();
   if (!available) return '【Discord 回复：原消息文字不可用】\n' + question;
 
@@ -31,7 +51,7 @@ function replyText(data, question, botId) {
   return '【Discord 引用原文】' + JSON.stringify(quote) + '\n【当前发言】' + question;
 }
 
-export function incoming(data, botId, config) {
+export function incoming(data, botId, config, attachmentText = '', allowed = config.channels.includes(data.channel_id)) {
   if (![0, 19].includes(data.type) || data.webhook_id || data.author?.bot ||
       data.author?.system || data.author?.id === botId || !snowflake(data.author?.id) ||
       !snowflake(data.id) || !snowflake(data.channel_id) || typeof data.content !== 'string') return;
@@ -41,13 +61,12 @@ export function incoming(data, botId, config) {
     if (data.author.id !== config.owner) return;
     peer = 'dm:' + data.author.id;
   } else {
-    if (!snowflake(data.guild_id) || !config.channels.includes(data.channel_id) ||
-        !data.mentions?.some(user => user.id === botId)) return;
+    if (!snowflake(data.guild_id) || !allowed || !addressesBot(data, botId)) return;
     const mention = new RegExp('<@!?' + botId + '>', 'g');
-    if (!mention.test(text)) return;
     text = text.replace(mention, '').trim();
     peer = 'guild:' + data.guild_id + ':' + data.channel_id;
   }
+  if (!text) text = attachmentText;
   if (!text) return;
   const nickname = data.member?.nick || data.author.global_name || data.author.username;
   return { peer, sender: data.author.id, messageId: data.id, text: replyText(data, text, botId),
@@ -72,7 +91,21 @@ export function splitText(text) {
   return parts;
 }
 
-export async function deliver(rest, message, config, account, signal) {
+export function startImageTyping(rest, channel, parentSignal) {
+  const controller = new AbortController();
+  const signal = AbortSignal.any([parentSignal, controller.signal]);
+  async function indicate() {
+    while (!signal.aborted) {
+      await rest.post('/channels/' + channel + '/typing', {signal});
+      await delay(8000, undefined, {signal});
+    }
+  }
+  // The optional indicator must never delay recognition or its reply.
+  void indicate().catch(() => {});
+  return () => controller.abort();
+}
+
+export async function deliver(rest, message, config, account, signal, channels) {
   signal.throwIfAborted();
   if (account !== message.account) throw Error('Bot 账号已变更');
   const [kind, first, second, extra] = message.peer.split(':');
@@ -83,7 +116,7 @@ export async function deliver(rest, message, config, account, signal) {
       throw Error('未确认私信收件人');
     channelId = dm.id;
   } else if (kind === 'guild' && snowflake(first) && snowflake(second) &&
-             config.channels.includes(second) && extra === undefined) {
+             extra === undefined && await allowedChannel(config, first, second, channels)) {
     channelId = second;
   } else throw Error('目的地不在当前允许范围内');
   const parts = splitText(message.text);

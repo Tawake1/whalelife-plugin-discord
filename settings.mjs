@@ -38,9 +38,11 @@ const back = '<p><a href="' + base + '/settings">返回 Discord 设置</a></p>';
 
 export function setupPage(ctx, api) {
   ctx.web.page(base + '/settings', (_req, res) => {
-    const { config: c, status, personas, account } = api.state();
+    const { config: c, status, personas, account, imageModels } = api.state();
     const options = personas.map(p => '<option value="' + escape(p.id) + '"' +
       (p.id === c.persona ? ' selected' : '') + '>' + escape(p.name) + '</option>').join('');
+    const imageOptions = imageModels.map(m => '<option value="' + escape(m.id) + '"' +
+      (m.id === c.imageModel ? ' selected' : '') + '>' + escape(m.name) + '</option>').join('');
     const stamp = hidden('revision', c.revision) + hidden('account', account);
     page(res, `<h1>Discord 设置</h1><p role="status">${escape(status)} ${account ? ' · Bot ' + escape(account) : ''}
     · <a href="${base}/settings">刷新状态</a></p>
@@ -49,11 +51,19 @@ export function setupPage(ctx, api) {
     <label for="token">Bot Token</label><input id="token" type="password" name="token" maxlength="512" autocomplete="new-password"
       placeholder="${c.token ? '已保存；留空沿用' : '从 Discord Developer Portal 的 Bot 页复制'}">
     <label for="persona">聊天人格</label><select id="persona" name="persona">${options}</select>
+    <label for="imageModel">图片识别模型</label><select id="imageModel" name="imageModel"><option value="">关闭图片识别</option>${imageOptions}</select>
+    <small>请选择能看图的对话模型。开启后，本条消息的前 3 张 PNG、JPEG 或 WebP（每张最多 2 MiB）和问题会发给所选模型。鲸鲸在会话里看到的是识图模型的文字转述。</small>
+    <label for="imageReasoning">识图思考模式</label><select id="imageReasoning" name="imageReasoning">
+    ${[['auto','自动（DeepSeek Flash 尝试关闭）'],['none','尝试关闭'],['model','跟随模型设置']].map(([value,label]) => '<option value="'+value+'" '+(c.imageReasoning === value ? 'selected':'')+'>'+label+'</option>').join('')}</select>
+    <label for="imageTimeout">每轮识图超时（秒）</label><input id="imageTimeout" name="imageTimeout" type="number" min="30" max="300" required value="${escape(c.imageTimeout)}">
     <label for="owner">允许私信的 Discord 用户 ID</label>
     <input id="owner" name="owner" value="${escape(c.owner)}" inputmode="numeric"><small>留空关闭私信。右键用户头像可复制 ID，需先在 Discord 开启开发者模式。</small>
     <label for="channels">允许回应的频道或讨论串 ID</label>
     <textarea id="channels" name="channels" rows="4">${escape(Array.isArray(c.channels) ? c.channels.join('\n') : '')}</textarea>
-    <small>每行一个 ID。讨论串单独添加。在这些位置直接 @ Bot 并输入文字即可。</small>
+    <small>每行一个 ID。可以直接 @ Bot，也可以回复这个 Bot 的消息。</small>
+    <label><input name="inheritThreads" type="checkbox" ${c.inheritThreads ? 'checked':''}> 允许列表中父频道下的讨论串</label>
+    <label><input name="replyIntent" type="checkbox" ${c.replyIntent ? 'checked':''}> 读取频道里未 @ Bot 的回复内容</label>
+    <small>如需稳定接收关闭提醒的回复，先在 Discord Developer Portal → Bot 打开 Message Content Intent，再勾选并保存。</small>
     <div class="actions"><button>保存连接设置</button></div></form>
     <section><h2>私信会话绑定</h2>
     <p>将上述用户的私信接到当前网页会话，或切回新的独立会话。绑定后，该用户能和鲸鲸聊到目标会话中的内容。</p>
@@ -64,7 +74,9 @@ export function setupPage(ctx, api) {
   ctx.web.api(base + '/save', async (req, res) => {
     try {
       const f = await fields(req);
-      await api.save(f.revision, { enabled: f.enabled === 'on', persona: f.persona,
+      await api.save(f.revision, { enabled: f.enabled === 'on', persona: f.persona, imageModel: f.imageModel || '',
+        imageTimeout: Number(f.imageTimeout ?? 120), imageReasoning: f.imageReasoning || 'auto',
+        replyIntent: f.replyIntent === 'on', inheritThreads: f.inheritThreads === 'on',
         owner: (f.owner || '').trim(), channels: [...new Set((f.channels || '').trim().split(/[\s,，]+/).filter(Boolean))],
         token: (f.token || '').trim() });
       res.writeHead(303, { Location: base + '/settings', 'Cache-Control': 'no-store' }); res.end();

@@ -3,13 +3,13 @@
  */
 import { randomUUID } from 'node:crypto';
 import { Events } from 'discord.js';
-import { addressesBot, allowedChannel, deliver, incoming, snowflake, startImageTyping } from './transport.mjs';
+import { allowedChannel, deliver, incoming, snowflake, startImageTyping } from './transport.mjs';
 import { registerCommand, handleCommand } from './commands.mjs';
-import { attachmentHint, imageAttachments, imageNote } from './images.mjs';
+import { attachmentHint, imageAttachments, imageLimitFor, imageNote, maxImageLimitMiB, validImageLimit } from './images.mjs';
 import { expiredImage, scheduleReceiptCleanup } from './receipts.mjs';
 import { setupPage } from './settings.mjs';
 
-const defaults = { enabled: false, token: '', owner: '', channels: [], pausedRoutes: [], inheritThreads: false, replyIntent: false, imageReasoning: 'auto', imageTimeout: 120, imageModel: '', persona: 'whale', revision: '' };
+const defaults = { enabled: false, token: '', owner: '', channels: [], pausedRoutes: [], inheritThreads: false, replyIntent: false, imageReasoning: 'auto', imageTimeout: 120, imageModel: '', imageLimitsMiB: {}, persona: 'whale', revision: '' };
 
 export function validate(config) {
   if (typeof config.enabled !== 'boolean' || typeof config.persona !== 'string' || !config.persona.trim() ||
@@ -21,6 +21,9 @@ export function validate(config) {
     throw Error('频道暂停记录无效。');
   if (config.imageModel !== undefined && (typeof config.imageModel !== 'string' || config.imageModel.length > 200))
     throw Error('图片识别模型 ID 无效。');
+  if (config.imageLimitsMiB !== undefined && (!config.imageLimitsMiB || typeof config.imageLimitsMiB !== 'object' ||
+      Array.isArray(config.imageLimitsMiB) || !Object.values(config.imageLimitsMiB).every(validImageLimit)))
+    throw Error('单图上限可设置为 0.1 至 ' + maxImageLimitMiB + ' MiB，最多一位小数。');
   if (config.imageTimeout !== undefined && (!Number.isInteger(config.imageTimeout) || config.imageTimeout < 30 || config.imageTimeout > 300))
     throw Error('识图超时可设置为 30 至 300 秒。');
   if (config.imageReasoning !== undefined && !['auto','none','model'].includes(config.imageReasoning))
@@ -105,41 +108,44 @@ export async function startPlugin(ctx, makeClient, downloadImage = fetch) {
         });
       } else if (packet.t === 'MESSAGE_CREATE' && run.handle) {
         if (packet.d.guild_id && config.pausedRoutes.includes(run.account + ':' + packet.d.channel_id)) return;
-        let allowed = false;
-        if (packet.d.guild_id) {
-          if (!addressesBot(packet.d, run.account) || packet.d.author?.bot || packet.d.webhook_id) return;
-          allowed = await allowedChannel(current, packet.d.guild_id, packet.d.channel_id, client.channels);
-          if (!allowed || signal.aborted) return;
-        }
+        const listed = current.channels.includes(packet.d.channel_id);
+        const checkParent = Boolean(packet.d.guild_id && !listed && current.inheritThreads);
+        // Reserve the peer queue before looking up a thread. Inherited routes are
+        // checked inside submit, before sending hints, reading images or calling receive.
         const supported = imageAttachments(packet.d);
+        const limitMiB = imageLimitFor(config.imageLimitsMiB, current.imageModel);
         const images = current.imageModel ? supported : [];
         if (supported.length && expiredImage(packet.d.id)) return;
         const hint = attachmentHint(packet.d.attachments, supported, current.imageModel);
-        const textInput = incoming(packet.d, run.account, current, '', allowed);
+        const textInput = incoming(packet.d, run.account, current, '', listed || checkParent);
         if (!textInput && !images.length && !hint) return;
-        const input = textInput ?? incoming(packet.d, run.account, current, '请看看这张图。', allowed);
+        const input = textInput ?? incoming(packet.d, run.account, current, '请看看这张图。', listed || checkParent);
         if (!input) return;
         const sendImageStatus = (text, kind = 'status') => deliver(client.rest, {account: run.account, peer: input.peer, text,
           replyTo: input.messageId, deliveryId: 'discord-image-' + kind + ':' + input.messageId}, current, run.account, signal, client.channels);
-        if (hint) {
-          const notice = sendImageStatus(hint);
-          if (!textInput) { await notice; return; }
-          void notice.catch(() => { if (!signal.aborted) ctx.logger.warn('Discord 附件提示发送失败'); });
-        }
         if (run.handle.supportsSenderProfile !== true) delete input.senderProfile;
         const preceding = run.preparing.get(input.peer);
         let receipt;
-        if (images.length || preceding) {
+        if (images.length || hint || checkParent || preceding) {
           const submit = async () => {
             signal.throwIfAborted();
+            if (checkParent) {
+              const allowed = await allowedChannel(current, packet.d.guild_id, packet.d.channel_id, client.channels);
+              if (!allowed || signal.aborted) return;
+            }
+            if (hint) {
+              const notice = sendImageStatus(hint);
+              if (!textInput) { await notice; return; }
+              void notice.catch(() => { if (!signal.aborted) ctx.logger.warn('Discord 附件提示发送失败'); });
+            }
             if (images.length) {
               const busy = activeImages >= 3;
               if (!busy) activeImages++;
               let recognition;
               try {
                 recognition = await imageNote({ctx, account:run.account, channel:packet.d.channel_id,
-                  input, images, attachments:packet.d.attachments, sendSizeNotice:text => sendImageStatus(text, 'size'),
-                  model:current.imageModel, reasoning:current.imageReasoning, timeoutSeconds:current.imageTimeout, signal, busy, download:downloadImage,
+                  input, images, attachments:packet.d.attachments, sendAttachmentNotice:text => sendImageStatus(text, 'size'),
+                  model:current.imageModel, limitMiB, reasoning:current.imageReasoning, timeoutSeconds:current.imageTimeout, signal, busy, download:downloadImage,
                   startTyping: () => startImageTyping(client.rest, packet.d.channel_id, signal)});
               } finally { if (!busy) activeImages--; }
               if (recognition.skippedAll && !textInput) return;
@@ -182,7 +188,7 @@ export async function startPlugin(ctx, makeClient, downloadImage = fetch) {
     state: () => ({ config, status: [status, active?.commandNotice].filter(Boolean).join(' · '), account: active?.account || '', personas: ctx.personas.list(), imageModels: ctx.models.list('chat').filter(m => m.callable) }),
     save: (revision, fields) => serial(async () => {
       if (revision !== config.revision) throw Error('配置已变更，请刷新后再保存。');
-      const next = validate({ ...fields, pausedRoutes: config.pausedRoutes, token: fields.token || config.token, revision: randomUUID() });
+      const next = validate({ ...fields, imageLimitsMiB:config.imageLimitsMiB, pausedRoutes: config.pausedRoutes, token: fields.token || config.token, revision: randomUUID() });
       if (next.imageModel && !ctx.models.list('chat').some(m => m.id === next.imageModel && m.callable))
         throw Error('请选择已启用、支持图像输入的对话模型。');
       if (!ctx.personas.list().some(p => p.id === next.persona)) throw Error('请选择已存在的人格。');
@@ -191,6 +197,13 @@ export async function startPlugin(ctx, makeClient, downloadImage = fetch) {
       await stop();
       ctx.signal.throwIfAborted();
       connect();
+    }),
+    saveImageLimit: (revision, model, limitMiB) => serial(async () => {
+      if (revision !== config.revision) throw Error('配置已变更，请刷新后再保存。');
+      if (!ctx.models.list('chat').some(m => m.callable && m.id === model)) throw Error('所选模型已不可用。');
+      const next = validate({...config, imageLimitsMiB:{...config.imageLimitsMiB, [model]:limitMiB}, revision:randomUUID()});
+      await ctx.config.save('config.json', next);
+      config = next;
     }),
     binding: (action, form) => serial(async () => {
       if (!active?.handle || !config.owner) throw Error('请先连接 Bot 并设置私信用户。');

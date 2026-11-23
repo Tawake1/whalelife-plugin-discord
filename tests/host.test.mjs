@@ -34,7 +34,7 @@ test('独立宿主进程：配置、网页续聊、频道/讨论串隔离、多�
   const folder = join(root, 'plugins/discord');
   await mkdir(folder, { recursive: true });
   await mkdir(join(root, 'config'));
-  for (const name of ['plugin.yaml', 'package.json', 'index.ts', 'plugin.mjs', 'images.mjs', 'commands.mjs', 'vision.mjs', 'receipts.mjs', 'transport.mjs', 'settings.mjs'])
+  for (const name of ['plugin.yaml', 'package.json', 'index.ts', 'plugin.mjs', 'images.mjs', 'commands.mjs', 'vision.mjs', 'receipts.mjs', 'transport.mjs', 'settings.mjs', 'settings-theme.mjs'])
     await copyFile(join(source, name), join(folder, name));
   await cp(join(source, 'node_modules'), join(folder, 'node_modules'), { recursive: true });
   const config = JSON.parse(await readFile(join(host, 'config.example.json'), 'utf8'));
@@ -97,7 +97,10 @@ test('独立宿主进程：配置、网页续聊、频道/讨论串隔离、多�
         client = new EventEmitter();
         client.login = async () => client.emit('raw', { t:'READY', d:{ user:{ bot:true, id:'${bot}' } } });
         client.destroy = async () => {};
-        client.channels = {cache:new Map(), async fetch(id) { return {id, guildId:'${server}',parentId:'${channel}',isThread:()=>id==='${thread}'}; }};
+        let firstLookup = true;
+        client.channels = {cache:new Map(), async fetch(id) {
+          if (firstLookup) { firstLookup = false; await new Promise(resolve => setTimeout(resolve,100)); }
+          return {id, guildId:'${server}',parentId:'${channel}',isThread:()=>id==='${thread}'}; }};
         client.rest = { async get() { return []; },
           async patch(path, {body}) { commandReplies.push(body.content); },
           async post(path, {body}) {
@@ -109,7 +112,7 @@ test('独立宿主进程：配置、网页续聊、频道/讨论串隔离、多�
           return { id:'${dmChannel}', channel_id:path.split('/')[2] };
         } };
         return client;
-      }, async () => new Response(Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/96kAAAAASUVORK5CYII=", "base64")));
+      }, async url => url.pathname.endsWith("large.png") ? new Response(Buffer.concat([Buffer.from("89504e470d0a1a0a","hex")], 5 * 1024 * 1024)) : url.pathname.endsWith(".gif") ? new Response("GIF89a") : new Response(Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/96kAAAAASUVORK5CYII=", "base64")));
     }`);
   await open();
   const save = { revision: '', enabled:'on', token:'offline-only-synthetic-token', persona:'whale', imageModel:'chat', owner, channels:channel+'\n'+thread };
@@ -212,11 +215,11 @@ test('独立宿主进程：配置、网页续聊、频道/讨论串隔离、多�
 
   assert.deepEqual(await service().typing(), []);
   const file = attachments => ({...media, attachments});
-  const gif = file([{content_type:'image/gif'}]);
+  const gif = file([{...media.attachments[0],url:media.attachments[0].url.replace('photo.png','photo.gif'),content_type:'image/gif',size:6}]);
   const beforeHints = calls.length;
   await send({...gif, author:{id:friend}});
   await send({...group, content:'', attachments:gif.attachments});
-  await send({...gif, id:'100000000000000042'});
+  await send({...gif, id:fresh(42)});
   await until(async () => (await service().sent()).length === 2);
   assert.match((await service().sent()).at(-1).body.content, /转成 PNG/);
   assert.equal(calls.length, beforeHints);
@@ -230,7 +233,7 @@ test('独立宿主进程：配置、网页续聊、频道/讨论串隔离、多�
   assert.match(calls.at(-1), /这段文字照常处理/);
   assert.equal(calls.length, beforeHints + 1);
   assert.equal(visionRequests.length, 3);
-  assert.deepEqual(await service().typing(), []);
+  assert.deepEqual(await service().typing(), ['/channels/'+dmChannel+'/typing']);
 
   const latest = await (await request(settings)).text();
   assert.equal((await request('/plugins/discord/save', {...save, revision:hidden(latest,'revision'),
@@ -238,16 +241,21 @@ test('独立宿主进程：配置、网页续聊、频道/讨论串隔离、多�
   const after = (await service().sent()).length;
   const threadImage = {...media, id:fresh(45), guild_id:server, channel_id:thread, type:19,
     message_reference:{message_id:imgId,channel_id:thread}, referenced_message:{id:imgId,channel_id:thread,author:{id:bot},content:'对比一下？'},
-    attachments:[1,2,3].map(() => ({...media.attachments[0],url:media.attachments[0].url.replace(dmChannel,thread)}))};
+    attachments:[1,2,3].map(() => ({...media.attachments[0],filename:'image.png',content_type:'image/webp',url:media.attachments[0].url.replace(dmChannel,thread)}))};
+  const secondThreadMessage = {...threadImage, id:fresh(47), content:'补充一下，先看第一张', attachments:[]};
   await send(threadImage);
-  await until(async () => (await service().sent()).length === after + 1);
+  await send(secondThreadMessage);
+  await until(async () => (await service().sent()).length === after + 2);
+  const ordered = (await service().sent()).slice(after).map(item=>item.body.message_reference.message_id);
+  assert.deepEqual(ordered,[threadImage.id,secondThreadMessage.id]);
   assert.equal((await service().sent()).at(-1).path, '/channels/'+thread+'/messages');
   assert.equal(visionRequests.at(-1).messages[1].content.filter(p=>p.type==='image_url').length, 3);
+  assert.ok(visionRequests.at(-1).messages[1].content.filter(p=>p.type==='image_url').every(p=>p.image_url.url.startsWith('data:image/png;base64,')));
   assert.match(calls.at(-1), /【图片转述】/);
   await invoke('pause', thread, '16', /已暂停/);
   await send({...threadImage,id:fresh(46)});
   await invoke('status', thread, '0', /已暂停/);
-  assert.equal((await service().sent()).length, after + 1);
+  assert.equal((await service().sent()).length, after + 2);
 
   const finalForm = await (await request(settings)).text();
   await request('/plugins/discord/save', {...save, revision:hidden(finalForm,'revision'), imageModel:'vision'});
@@ -281,4 +289,35 @@ test('独立宿主进程：配置、网页续聊、频道/讨论串隔离、多�
   await until(async () => (await service().sent()).length === baseline + 7);
   assert.match(calls.at(-1),/另一个文字问题/);
   assert.match(calls.at(-1),/本次没有图片识别结果/);
+  const revision = async () => hidden(await (await request(settings)).text(), 'revision');
+  const limitPath = '/plugins/discord/image-limit';
+  const original = await revision();
+  for (const limitMiB of ['', 'NaN', '-2', '0.01', '32.1']) {
+    assert.equal((await request(limitPath, {revision:original, model:'vision', limitMiB})).status, 400);
+  }
+  assert.equal((await request(limitPath, {revision:original, model:'missing', limitMiB:'8'})).status, 400);
+  assert.equal((await request(limitPath, {revision:original, model:'vision', limitMiB:'4'})).status, 303);
+  assert.equal((await request(limitPath, {revision:original, model:'chat', limitMiB:'8'})).status, 400);
+  assert.equal((await request(limitPath, {revision:await revision(), model:'chat', limitMiB:'8'})).status, 303);
+
+  const fiveMiB = {...large, size:5 * 1024 * 1024, url:large.url.replace('photo.png','large.png')};
+  const sendLarge = suffix => send({...media,id:fresh(suffix),attachments:[fiveMiB]});
+  await sendLarge(73);
+  await until(async () => (await service().sent()).length === baseline + 8);
+  assert.match((await service().sent()).at(-1).body.content, /图1超过 4 MiB/);
+
+  assert.equal((await request('/plugins/discord/save', {...save, revision:await revision(), imageModel:'chat'})).status, 303);
+  await app.close(); await open();
+  const reloaded = await (await request(settings)).text();
+  for (const [model, limit] of [['chat',8], ['vision',4]]) {
+    const form = reloaded.split('<form ').find(f => f.includes('name="model" value="'+model+'"'));
+    assert.ok(form?.includes('required value="'+limit+'"'));
+  }
+  await sendLarge(74);
+  await until(async () => (await service().sent()).length === 1);
+  const visionCall = visionRequests.at(-1);
+  assert.equal(visionCall.model, 'chat');
+  const dataUrl = visionCall.messages[1].content.find(part => part.type === 'image_url').image_url.url;
+  assert.equal(Buffer.from(dataUrl.split(',')[1], 'base64').length, fiveMiB.size);
+
 });

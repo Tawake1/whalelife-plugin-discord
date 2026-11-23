@@ -4,20 +4,40 @@
 import { observationClient } from './vision.mjs';
 import { snowflake } from './transport.mjs';
 
-const limit = 2 * 1024 * 1024;
-const types = new Set(['image/png', 'image/jpeg', 'image/webp']);
+export const defaultImageLimitMiB = 2;
+export const maxImageLimitMiB = 32;
+
+export function validImageLimit(value) {
+  return typeof value === 'number' && Number.isInteger(value * 10) && value >= 0.1 && value <= maxImageLimitMiB;
+}
+
+export function imageLimitFor(limits, model) {
+  return limits && Object.hasOwn(limits, model) && validImageLimit(limits[model]) ? limits[model] : defaultImageLimitMiB;
+}
+const pngHeader = Buffer.from('89504e470d0a1a0a','hex');
+const jpegHeader = Buffer.from('ffd8ff','hex');
+const riffHeader = Buffer.from('RIFF');
+const webpHeader = Buffer.from('WEBP');
+
+function imageType(bytes) {
+  if (bytes.subarray(0, 8).equals(pngHeader)) return 'image/png';
+  if (bytes.subarray(0, 3).equals(jpegHeader)) return 'image/jpeg';
+  if (bytes.subarray(0, 4).equals(riffHeader) && bytes.subarray(8, 12).equals(webpHeader)) return 'image/webp';
+  return null;
+}
+
 const unread = '图片未能识别，请重新发送图片，或用文字补充。';
 
 export function imageAttachments(data) {
-  return Array.isArray(data.attachments) ? data.attachments.filter(a => types.has(a?.content_type)) : [];
+  if (!Array.isArray(data.attachments)) return [];
+  return data.attachments.filter(file => /^image\//i.test(file?.content_type ?? '') ||
+    /\.(?:png|jpe?g|webp)$/i.test(file?.filename ?? ''));
 }
 
 export function attachmentHint(attachments, supported, model) {
   if (!Array.isArray(attachments)) return '';
   if (supported.length) return model ? '' :
     '图片识别已关闭。请在 WhaleLife 的「插件管理 → Discord → 设置 → 图片识别模型」选择能看图的模型，保存后再发一次。';
-  if (attachments.some(file => typeof file?.content_type === 'string' && file.content_type.startsWith('image/')))
-    return '这张图的格式暂时读不了。请转成 PNG、JPEG 或 WebP 后再发一次。';
   if (attachments.some(file => file && (!file.content_type || file.content_type === 'application/octet-stream')))
     return '没能确认这个附件的格式。如果是图片，请另存为 PNG、JPEG 或 WebP 后再发一次。';
   return '';
@@ -26,7 +46,7 @@ export function attachmentHint(attachments, supported, model) {
 class ImageFormatError extends Error {}
 class ImageSizeError extends Error {}
 
-async function discordImage(attachment, channel, signal, download) {
+async function discordImage(attachment, channel, signal, download, limit) {
   const url = new URL(attachment.url);
   const parts = url.pathname.split('/');
   if (url.origin !== 'https://cdn.discordapp.com' || url.username || url.password ||
@@ -36,7 +56,9 @@ async function discordImage(attachment, channel, signal, download) {
   if (!Number.isSafeInteger(attachment.size) || attachment.size < 1 || attachment.size > limit)
     throw Error('invalid image size');
   const response = await download(url, { signal, redirect: 'error', credentials: 'omit' });
-  if (response.ok && Number(response.headers.get('content-length')) > limit) {
+  const length = response.headers.get('content-length');
+  const responseSize = length !== null && /^\d+$/.test(length) ? Number(length) : null;
+  if (response.ok && responseSize !== null && responseSize > limit) {
     await response.body?.cancel();
     throw new ImageSizeError();
   }
@@ -49,32 +71,33 @@ async function discordImage(attachment, channel, signal, download) {
   for await (const chunk of response.body) {
     size += chunk.length;
     if (size > limit) throw new ImageSizeError();
-    if (size > attachment.size) throw Error('image size mismatch');
     chunks.push(chunk);
   }
-  if (size !== attachment.size) throw Error('incomplete image');
+  // Fetch decodes content encodings; Content-Length counts bytes before decoding.
+  const encoding = response.headers.get('content-encoding')?.trim().toLowerCase();
+  if ((!encoding || encoding === 'identity') && responseSize !== null && size !== responseSize)
+    throw Error('response size mismatch');
   const bytes = Buffer.concat(chunks, size);
-  const mime = attachment.content_type;
-  const valid = (mime === 'image/png' && bytes.subarray(0, 8).toString('hex') === '89504e470d0a1a0a') ||
-    (mime === 'image/jpeg' && bytes.subarray(0, 3).toString('hex') === 'ffd8ff') ||
-    (mime === 'image/webp' && bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP');
-  if (!valid) throw new ImageFormatError('image format mismatch');
-  return 'data:' + mime + ';base64,' + bytes.toString('base64');
+  const mime = imageType(bytes);
+  if (!mime) throw new ImageFormatError('unrecognized image header');
+  return {mime, url:'data:' + mime + ';base64,' + bytes.toString('base64')};
 }
 
 // Successful observations must stay identical across redelivery because the host deduplicates by message ID.
-export async function imageNote({ ctx, account, channel, input, images, attachments = images, sendSizeNotice, model, reasoning = 'model', timeoutSeconds = 120, signal, busy = false, download = fetch, startTyping }) {
+export async function imageNote({ ctx, account, channel, input, images, attachments = images, sendAttachmentNotice, model, reasoning = 'model', timeoutSeconds = 120, limitMiB = defaultImageLimitMiB, signal, busy = false, download = fetch, startTyping }) {
+  const limit = Math.floor(limitMiB * 1024 * 1024);
   const file = 'image-receipts/' + account + '/' + channel + '/' + input.messageId + '.json';
   const previous = await ctx.config.read(file);
   signal.throwIfAborted();
   async function result(record) {
-    if (record.sizeNotice && !record.noticeSent && sendSizeNotice) {
+    const notice = record.attachmentNotice ?? record.sizeNotice;
+    if (notice && !record.noticeSent && sendAttachmentNotice) {
       try {
-        await sendSizeNotice(record.sizeNotice);
+        await sendAttachmentNotice(notice);
         await ctx.config.save(file, {...record, noticeSent:true});
       } catch {
         signal.throwIfAborted();
-        ctx.logger.warn('Discord 图片大小提示未确认');
+        ctx.logger.warn('Discord 附件提示未确认');
       }
     }
     return {note: record.note, retryable:record.state === 'failed', skippedAll:record.state === 'skipped'};
@@ -87,12 +110,17 @@ export async function imageNote({ ctx, account, channel, input, images, attachme
   let note = unread;
   let finishReason = null;
   let state = 'failed';
+  const formats = [];
+  const unknownFormats = [];
   const oversized = [];
+  const failedDownloads = [];
   const eligible = [];
   for (const attachment of images.slice(0, 3)) {
     const number = attachments.indexOf(attachment) + 1;
+    const format = {number, declared_type:typeof attachment.content_type === 'string' ? attachment.content_type : null, detected_type:null};
+    formats.push(format);
     if (attachment.size > limit) oversized.push(number);
-    else eligible.push({attachment, number});
+    else eligible.push({attachment, format});
   }
   if (!eligible.length) {
     state = 'skipped';
@@ -103,21 +131,29 @@ export async function imageNote({ ctx, account, channel, input, images, attachme
     let timeout;
     const stopTyping = startTyping?.();
     try {
-      const content = [{type:'text', text:input.text.slice(0, 1600)}];
+      const content = [{type:'text', text:input.text}];
       timeout = AbortSignal.any([signal, AbortSignal.timeout(60000)]);
-      for (const {attachment, number} of eligible) {
+      for (const {attachment, format} of eligible) {
+        const {number} = format;
         stage = '下载图' + number;
         try {
-          const url = await discordImage(attachment, channel, timeout, download);
           timeout.throwIfAborted();
+          const {url, mime} = await discordImage(attachment, channel, timeout, download, limit);
+          timeout.throwIfAborted();
+          format.detected_type = mime;
           content.push({type:'text', text:'图' + number}, {type:'image_url', image_url:{url}});
         } catch (error) {
-          if (!(error instanceof ImageSizeError)) throw error;
-          oversized.push(number);
+          signal.throwIfAborted();
+          if (error instanceof ImageSizeError) oversized.push(number);
+          else if (error instanceof ImageFormatError) unknownFormats.push('图' + number);
+          else if (timeout.aborted || error?.name === 'TimeoutError') failedDownloads.push(stage + '超时');
+          else failedDownloads.push(stage + '失败');
         }
       }
-      if (content.length === 1) state = 'skipped';
-      else {
+      if (content.length === 1) {
+        if (failedDownloads.length) note = failedDownloads.join('；') + '，请重新发送。';
+        else state = 'skipped';
+      } else {
         stage = '识图模型';
         const chat = observationClient(ctx, model, reasoning);
         const messages = [
@@ -148,27 +184,40 @@ export async function imageNote({ ctx, account, channel, input, images, attachme
       }
     } catch (error) {
       signal.throwIfAborted();
-      if (error instanceof ImageFormatError) note = '图片内容与附件标注的格式不一致，请重新导出为 PNG、JPEG 或 WebP。';
-      else if (timeout?.aborted || error?.name === 'TimeoutError') note = stage + '超时，请稍后重新发送这条消息。';
+      if (timeout?.aborted || error?.name === 'TimeoutError') note = stage + '超时，请稍后重新发送这条消息。';
       else note = stage + '失败，请稍后重新发送这条消息。';
     } finally {
       stopTyping?.();
     }
   }
-  let sizeNotice;
+  const notices = [];
+  const unavailable = [];
   if (oversized.length) {
     const labels = oversized.sort((a,b) => a-b).map(n => '图' + n).join('、');
-    sizeNotice = labels + '超过 2 MiB，已跳过。请压缩后单独重发。';
-    const unavailable = '【附件状态】' + labels + '超过 2 MiB，未送入识图模型，内容未知。';
-    if (state === 'done') note += '\n' + unavailable;
-    if (state === 'skipped') note = unavailable + '本次没有图片识别结果。';
+    notices.push(labels + '超过 ' + limitMiB + ' MiB（当前模型的单图上限），已跳过。请压缩后单独重发。');
+    unavailable.push(labels + '超过 ' + limitMiB + ' MiB，未送入识图模型，内容未知。');
   }
-  if (images.length > 3) note += '（共 ' + images.length + ' 张支持的图片，本次取前 3 张。）';
+  if (unknownFormats.length) {
+    const detail = unknownFormats.join('、') + '的文件头未识别为 PNG、JPEG 或 WebP';
+    notices.push(detail + '，请转成 PNG、JPEG 或 WebP 后重发。');
+    unavailable.push(detail + '，内容未知。');
+  }
+  if (unavailable.length) {
+    const summary = '【附件状态】' + unavailable.join('');
+    if (state === 'done') note += '\n' + summary;
+    if (state === 'skipped') note = summary + '本次没有图片识别结果。';
+  }
+  if (failedDownloads.length && state === 'done') {
+    const detail = failedDownloads.join('；');
+    note += '\n【附件状态】' + detail + '。这些图片未送入识图模型，内容未知。';
+    notices.push(detail + '。请单独重发相应的图片。');
+  }
+  if (images.length > 3) note += '（共 ' + images.length + ' 张图片附件，本次取前 3 张。）';
   signal.throwIfAborted();
-  const record = {state, finish_reason:finishReason, note};
-  if (sizeNotice) {
-    record.sizeNotice = sizeNotice;
-    record.noticeSent = previous.sizeNotice === sizeNotice && previous.noticeSent === true;
+  const record = {state, finish_reason:finishReason, note, attachments:formats};
+  if (notices.length) {
+    record.attachmentNotice = notices.join('\n');
+    record.noticeSent = (previous.attachmentNotice ?? previous.sizeNotice) === record.attachmentNotice && previous.noticeSent === true;
   }
   await ctx.config.save(file, record);
   return result(record);

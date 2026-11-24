@@ -35,10 +35,26 @@ export function validate(config) {
   return config;
 }
 
+const loginRetrySeconds = [5, 15, 45];
+
+function connectionCode(error) {
+  for (const value of [error?.code, error?.cause?.code]) {
+    if (Number.isFinite(value) || (typeof value === 'string' && value.trim())) return String(value).slice(0, 128);
+  }
+  return '';
+}
+
 export async function startPlugin(ctx, makeClient, downloadImage = fetch) {
   let config = { ...defaults, ...await ctx.config.read() };
   let status = '未连接';
   let active;
+  let retryTimer;
+  let lastError = '';
+  function reportError(label, error, fallback = '') {
+    const code = connectionCode(error) || fallback || '未提供';
+    lastError = label + ' · 错误码 ' + code;
+    ctx.logger.warn(label, {code});
+  }
   let tail = Promise.resolve();
   const serial = fn => {
     const next = tail.then(() => { ctx.signal.throwIfAborted(); return fn(); });
@@ -47,6 +63,8 @@ export async function startPlugin(ctx, makeClient, downloadImage = fetch) {
   };
 
   async function stop() {
+    clearTimeout(retryTimer);
+    retryTimer = undefined;
     const old = active;
     active = undefined;
     if (!old) return;
@@ -55,7 +73,13 @@ export async function startPlugin(ctx, makeClient, downloadImage = fetch) {
     finally { await old.client.destroy(); }
   }
 
-  function connect() {
+  async function restart(attempt = 0) {
+    await stop();
+    ctx.signal.throwIfAborted();
+    connect(attempt);
+  }
+
+  function connect(attempt = 0) {
     if (!config.enabled) { status = '连接已关闭'; return; }
     const client = makeClient(config);
     const run = { client, controller: new AbortController(), account: '', handle: null };
@@ -65,13 +89,19 @@ export async function startPlugin(ctx, makeClient, downloadImage = fetch) {
     let activeImages = 0;
     const signal = AbortSignal.any([ctx.signal, run.controller.signal]);
     const current = config;
-    status = '正在连接';
+    status = attempt ? '正在重试登录（' + attempt + '/' + loginRetrySeconds.length + '）' : '正在连接';
     const setStatus = value => { if (!signal.aborted) status = value; };
-    client.on(Events.Error, () => setStatus('Discord 连接异常，请检查网络或重新连接'));
-    client.on(Events.ShardError, () => setStatus('Discord 网关连接异常'));
+    const connectionFailed = (label, error) => {
+      if (signal.aborted) return;
+      run.lastCode = connectionCode(error) || run.lastCode;
+      reportError(label, error, run.lastCode);
+      setStatus(label);
+    };
+    client.on(Events.Error, error => connectionFailed('Discord 连接异常', error));
+    client.on(Events.ShardError, error => connectionFailed('Discord 网关连接异常', error));
     client.on(Events.ShardReconnecting, () => setStatus('正在重连'));
     client.on(Events.ShardResume, () => setStatus('已连接'));
-    client.on(Events.ShardDisconnect, event => setStatus('连接已断开，代码 ' + event.code));
+    client.on(Events.ShardDisconnect, event => connectionFailed('Discord 网关连接已断开', event));
     async function dispatch(packet) {
       if (signal.aborted) return;
       if (packet.t === 'READY') {
@@ -91,8 +121,11 @@ export async function startPlugin(ctx, makeClient, downloadImage = fetch) {
         if (current.channels.length && !run.commandId && !run.registering) {
           run.registering = true;
           try { run.commandId = await registerCommand(client.rest, user.id, signal); }
-          catch {
-            if (!signal.aborted) run.commandNotice = '频道命令注册失败，请检查应用命令授权和 /whale 同名冲突，再保存设置重连。';
+          catch (error) {
+            if (!signal.aborted) {
+              reportError('频道命令注册失败', error);
+              run.commandNotice = '请检查应用命令授权和 /whale 同名冲突，再点「重新连接」。';
+            }
           } finally { run.registering = false; }
           if (run.commandId) run.commandNotice = '';
         }
@@ -173,19 +206,56 @@ export async function startPlugin(ctx, makeClient, downloadImage = fetch) {
       }
     }
     client.on(Events.Raw, packet => {
-      void dispatch(packet).catch(() => {
+      void dispatch(packet).catch(error => {
         if (signal.aborted) return;
-        if (packet.t === 'READY') setStatus('注册渠道失败，请核对人格并重新连接');
+        if (packet.t === 'READY') connectionFailed('注册渠道失败，请核对人格并重新连接', error);
         ctx.logger.warn('Discord 事件未完成', { event: packet.t });
       });
     });
-    void client.login(current.token).catch(() => setStatus('登录失败，请核对 Token、网络和 Bot 设置后重新连接'));
+    async function login() {
+      try {
+        await client.login(current.token);
+      } catch (error) {
+        await serial(async () => {
+          if (active !== run || signal.aborted) return;
+          reportError('Discord 登录失败', error, run.lastCode);
+          await stop();
+          if (ctx.signal.aborted) return;
+          const seconds = loginRetrySeconds[attempt];
+          if (seconds === undefined) {
+            status = '登录失败，3 次自动重试已用完。可点「重新连接」。';
+            return;
+          }
+          status = '登录失败，' + seconds + ' 秒后进行第 ' + (attempt + 1) + ' 次重试';
+          const timer = setTimeout(() => {
+            void serial(() => {
+              if (timer !== retryTimer) return;
+              retryTimer = undefined;
+              connect(attempt + 1);
+            }).catch(recoveryFailed);
+          }, seconds * 1000);
+          retryTimer = timer;
+        });
+      }
+    }
+    function recoveryFailed(error) {
+      if (ctx.signal.aborted) return;
+      status = '连接恢复失败，可点「重新连接」。';
+      reportError('Discord 连接恢复失败', error);
+    }
+    void login().catch(recoveryFailed);
   }
 
   ctx.effect(() => scheduleReceiptCleanup(ctx));
   ctx.effect(() => stop);
   setupPage(ctx, {
-    state: () => ({ config, status: [status, active?.commandNotice].filter(Boolean).join(' · '), account: active?.account || '', personas: ctx.personas.list(), imageModels: ctx.models.list('chat').filter(m => m.callable) }),
+    state: () => ({ config, lastError, status: [status, active?.commandNotice].filter(Boolean).join(' · '), account: active?.account || '', personas: ctx.personas.list(), imageModels: ctx.models.list('chat').filter(m => m.callable) }),
+    reconnect: revision => serial(async () => {
+      if (revision !== config.revision) throw Error('配置已变更，请刷新后再连接。');
+      if (!config.enabled) throw Error('请先启用并保存 Discord 连接。');
+      validate(config);
+      await restart();
+    }),
     save: (revision, fields) => serial(async () => {
       if (revision !== config.revision) throw Error('配置已变更，请刷新后再保存。');
       const next = validate({ ...fields, imageLimitsMiB:config.imageLimitsMiB, pausedRoutes: config.pausedRoutes, token: fields.token || config.token, revision: randomUUID() });
@@ -194,9 +264,7 @@ export async function startPlugin(ctx, makeClient, downloadImage = fetch) {
       if (!ctx.personas.list().some(p => p.id === next.persona)) throw Error('请选择已存在的人格。');
       await ctx.config.save('config.json', next);
       config = next;
-      await stop();
-      ctx.signal.throwIfAborted();
-      connect();
+      await restart();
     }),
     saveImageLimit: (revision, model, limitMiB) => serial(async () => {
       if (revision !== config.revision) throw Error('配置已变更，请刷新后再保存。');

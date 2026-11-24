@@ -123,6 +123,10 @@ test('独立宿主进程：配置、网页续聊、频道/讨论串隔离、多�
   assert.ok(!html.includes(save.token));
   assert.equal((await request('/plugins/discord/save', save)).status, 400);
   const binding = { revision:hidden(html, 'revision'), account:bot };
+  const reconnectPath = '/plugins/discord/reconnect';
+  assert.equal((await request(reconnectPath, {revision:'stale'})).status, 409);
+  assert.equal((await request(reconnectPath, {revision:binding.revision})).status, 303);
+  assert.equal(hidden(await (await request(settings)).text(), 'revision'), binding.revision);
   const web = await app.sessions.current();
   await app.channels.web(web, '网页私信暗号', () => {});
   const preview = await (await request('/plugins/discord/binding', { ...binding, action:'preview' })).text();

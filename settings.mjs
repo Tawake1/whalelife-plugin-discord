@@ -114,6 +114,8 @@ code { font-family:"IBM Plex Mono",ui-monospace,monospace; overflow-wrap:anywher
   .unit { max-width:9rem }
 }
 ${themeStyles}
+.summary .reconnect { font-size:.85rem; min-height:2rem; margin-top:.3rem; padding:.2rem .55rem }
+.summary .diagnostic { font-weight:400; line-height:1.35; margin-top:.3rem }
 </style><main><div data-start="${start}" class="${detail ? 'detail' : 'settings'}">` + content + '</div></main></html>');
 }
 async function fields(req) {
@@ -132,7 +134,7 @@ const back = '<p><a href="' + base + '/settings">返回 Discord 设置</a></p>';
 
 export function setupPage(ctx, api) {
   ctx.web.page(base + '/settings', (_req, res) => {
-    const { config: c, status, personas, account, imageModels } = api.state();
+    const { config: c, status, lastError, personas, account, imageModels } = api.state();
     const options = personas.map(p => '<option value="' + escape(p.id) + '"' +
       (p.id === c.persona ? ' selected' : '') + '>' + escape(p.name) + '</option>').join('');
     const imageOptions = imageModels.map(m => '<option value="' + escape(m.id) + '"' +
@@ -149,7 +151,10 @@ export function setupPage(ctx, api) {
     page(res, `<div class="topbar"><button class="menu" type="button" aria-expanded="false" aria-controls="settings-nav">导航</button>
     <span class="crumb">插件管理 › Discord</span>
     <div class="chooser" role="group" aria-label="外观"><button type="button" data-choice="swiss">瑞士风</button><button type="button" data-choice="discord">Discord 风</button></div></div><header><div class="hero"><div><p class="context">WhaleLife / 插件管理</p><h1>Discord 设置</h1></div><div class="mark" aria-hidden="true"></div></div>
-    <dl class="summary"><div><dt>连接状态 · <a href="${base}/settings">刷新</a></dt><dd role="status" class="${status === '已连接' ? 'online' : ''}">${escape(status)}</dd></div>
+    <dl class="summary"><div><dt>连接状态 · <a href="${base}/settings">刷新</a></dt><dd role="status" class="${status === '已连接' ? 'online' : ''}">${escape(status)}</dd>
+    ${lastError ? '<dd class="diagnostic"><small>最近一次 · ' + escape(lastError) + '</small></dd>' : ''}
+    <dd><form method="post" action="${base}/reconnect">${hidden('revision', c.revision)}
+    <button type="submit" class="reconnect" title="使用已保存的设置重新登录 Discord" ${c.enabled ? '' : 'disabled'}>重新连接</button></form></dd></div>
     <div><dt>当前识图模型</dt><dd>${activeModel ? escape(activeModel.name) : c.imageModel ? '模型不可用' : '已关闭'}</dd></div>
     <div><dt>单图上限</dt><dd>${activeModel ? imageLimitFor(c.imageLimitsMiB, activeModel.id) + ' MiB' : '未启用'}</dd></div></dl></header>
     <div class="layout"><nav id="settings-nav" aria-label="本页设置"><div class="brand"><svg viewBox="0 0 40 40" aria-hidden="true"><path fill="currentColor" d="M6 18c1 1 2 2 5 2 2-5 6-8 12-8 7 0 11 5 11 11 0 5-5 9-13 9-7 0-13-4-13-9-4-1-5-4-5-7l3 2Z"/><circle cx="27" cy="20" r="1.5" fill="#4b48ad"/><path d="M21 9c0-3 2-4 3-5m-4 5c-1-2-2-3-4-3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg><div><b>WhaleLife</b><small>插件设置</small></div></div><p class="nav-title">本页设置</p>
@@ -186,6 +191,14 @@ export function setupPage(ctx, api) {
     <small>${!account || !c.owner ? '先连接 Bot，并保存允许私信的用户 ID。' : '查看后可确认更改。'}</small></div></form></div></section></div></div>`, 200, false, activeModel && c.enabled ? 'vision' : 'connection');
   }, { title: 'Discord 设置', settings: true, navigation: true });
 
+  ctx.web.api(base + '/reconnect', async (req, res) => {
+    try {
+      if (req.method !== 'POST') throw Error('请使用设置页上的重新连接按钮。');
+      const f = await fields(req);
+      await api.reconnect(f.revision);
+      res.writeHead(303, { Location: base + '/settings', 'Cache-Control': 'no-store' }); res.end();
+    } catch (error) { page(res, '<h1>重新连接失败</h1><p>' + escape(error.message) + '</p>' + back, 409); }
+  });
   ctx.web.api(base + '/save', async (req, res) => {
     try {
       const f = await fields(req);

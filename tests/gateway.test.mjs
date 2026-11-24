@@ -86,3 +86,68 @@ test('真实 SDK 在本机 Gateway 登录、REST 投递并恢复断线会话', {
   socket.close(4000, 'reconnect test');
   await waitFor(() => resumed);
 });
+
+test('登录失败依次等待5/15/45秒，新客户端重试，手动重连可打断等待', async t => {
+  const { EventEmitter } = await import('node:events');
+  const { Readable } = await import('node:stream');
+  const flush = () => new Promise(resolve => setImmediate(resolve));
+  t.mock.timers.enable({apis:['setTimeout']});
+  const controller = new AbortController();
+  const routes = new Map(), clients = [], cleanups = [];
+  const config = {enabled:true, token:'fixture-secret', revision:'r', persona:'whale', owner:'100000000000000002', channels:[]};
+  let writes = 0, succeed = false;
+  await startPlugin({
+    signal:controller.signal, config:{read:async () => config, save:async () => {writes++;}},
+    web:{page:(p,h)=>routes.set(p,h),api:(p,h)=>routes.set(p,h)}, logger:{warn(){}},
+    personas:{list:()=>[{id:'whale'}]}, models:{list:()=>[]}, channels:{register:()=>({dispose(){}})},
+    effect:fn=>cleanups.push(fn())
+  }, () => {
+    const client = new EventEmitter();
+    clients.push(client);
+    client.destroy = async () => { client.disposed = true; };
+    client.login = async () => {
+      if (succeed) { client.emit('raw',{t:'READY',d:{user:{bot:true,id:config.owner}}}); return; }
+      if (clients.length === 2) {
+        client.emit('shardDisconnect', {code:4014});
+        throw Error('SDK wrapper without code');
+      }
+      throw Object.assign(Error(config.token),{cause:{code:'ECONNRESET'}});
+    };
+    return client;
+  });
+  t.after(async () => { controller.abort(); for (const fn of cleanups.reverse()) await fn(); });
+  async function request(route, form) {
+    const req = Readable.from([Buffer.from(new URLSearchParams(form).toString())]);
+    req.method = 'POST'; req.headers = {'content-type':'application/x-www-form-urlencoded'};
+    const res = {writeHead(code){this.code=code;},end(body){this.body=body;}};
+    await routes.get('/plugins/discord/'+route)(req,res);
+    return res;
+  }
+  async function state(expected) {
+    const page = await request('settings');
+    assert.match(page.body,expected); assert.ok(!page.body.includes(config.token));
+  }
+  async function tick(ms) { t.mock.timers.tick(ms); await flush(); }
+  await flush();
+  for (const [index,seconds] of [5,15,45].entries()) {
+    await state(new RegExp(seconds + ' 秒后进行第 ' + (index+1) + ' 次'));
+    await state(index === 1 ? /错误码 4014/ : /错误码 ECONNRESET/);
+    assert.equal(clients[index].disposed,true);
+    await tick(seconds*1000-1); assert.equal(clients.length,index+1);
+    await tick(1); assert.equal(clients.length,index+2);
+  }
+  await state(/3 次自动重试已用完/); await tick(120000); assert.equal(clients.length,4);
+  assert.equal((await request('reconnect',{revision:'r'})).code,303);
+  await flush(); await state(/5 秒后进行第 1 次/);
+  await tick(4000); succeed = true;
+  assert.equal((await request('reconnect',{revision:'r'})).code,303);
+  await flush(); await state(/已连接/);
+  await tick(60000); assert.equal(clients.length,6);
+  clients[0].emit('shardError',{code:'OBSOLETE'}); await state(/错误码 ECONNRESET/);
+  assert.equal(writes,0);
+  succeed = false;
+  await request('reconnect',{revision:'r'}); await flush();
+  const saved = await request('save',{revision:'r',persona:'whale',owner:config.owner,enabled:'off'});
+  assert.equal(saved.code,303); await state(/连接已关闭/);
+  await tick(60000); assert.equal(clients.length,7); assert.equal(writes,1);
+});

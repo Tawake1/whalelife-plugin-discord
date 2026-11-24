@@ -1,4 +1,6 @@
-# WhaleLife Discord 插件 0.5.7
+# WhaleLife Discord 插件 0.5.8
+
+登录失败后，插件依次等待 5、15、45 秒，最多自动重试 3 次。页首「连接状态」显示重试进度和最近一次连接错误码，点「刷新」可查看最新状态。点「重新连接」会立即使用已保存的配置，并重新计算重试次数。关闭连接或停用插件会取消待执行的重试。
 
 设置页默认使用 Discord 深色外观。右上角可切换到瑞士风，选择保存在当前浏览器中。切换时仍可继续编辑未保存的表单。
 
@@ -16,7 +18,7 @@
    npm ci --omit=dev --ignore-scripts
    ```
 
-   也可以从仓库页面选择 **Code → Download ZIP**，解压后将含有 `plugin.yaml` 的文件夹命名为 `discord`，放入 WhaleLife 的 `plugins` 目录，再到该文件夹执行上述 npm 命令。已有独立安装包 `discord-0.5.7-install.zip` 的用户可直接解压安装，包中已带依赖。
+   也可以从仓库页面选择 **Code → Download ZIP**，解压后将含有 `plugin.yaml` 的文件夹命名为 `discord`，放入 WhaleLife 的 `plugins` 目录，再到该文件夹执行上述 npm 命令。已有独立安装包 `discord-0.5.8-install.zip` 的用户可直接解压安装，包中已带依赖。
 3. 启动 WhaleLife，打开「插件管理 → Discord → 设置」。如果插件已被手动停用，先启用插件。
 4. 在 [Discord Developer Portal](https://discord.com/developers/applications) 创建 Application，在 Bot 页取得 Bot Token。在 Installation 页为 Guild Install 选择 `bot` scope，使用安装链接将 Bot 加入测试服务器。可以把安装链接发给服主或有「管理服务器」权限的成员，请对方选择服务器并授权。
 5. 给 Bot 授予 **View Channel、Send Messages、Read Message History**。使用讨论串时另授予 **Send Messages in Threads**，并让 Bot 能看见和进入目标讨论串。首版使用普通 Guilds、Guild Messages、Direct Messages Gateway intents；私信和显式 @ 使用默认 intents。若希望频道成员关闭回复提醒后也能发文字或图片，先在 Developer Portal → Bot → Privileged Gateway Intents 开启 Message Content Intent，再在插件设置勾选「接收回复 Bot 时未 @ 它的消息」并保存。经验证的应用可能需要 Discord 批准该意图。

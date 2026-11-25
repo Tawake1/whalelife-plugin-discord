@@ -6,6 +6,10 @@ import { observationClient } from './vision.mjs';
 import { snowflake } from './transport.mjs';
 
 export const hostImageLimitMiB = 4;
+const maxPictures = 10;
+const nativeTotalBytes = 16 * 1024 * 1024;
+// Bound one auxiliary request to the previous worst case of three 32 MiB pictures.
+const descriptionTotalBytes = 96 * 1024 * 1024;
 export const defaultImageLimitMiB = 2;
 export const maxImageLimitMiB = 32;
 
@@ -166,8 +170,16 @@ export async function imageNote({ ctx, account, channel, input, images, attachme
   const oversized = [];
   const failedDownloads = [];
   const eligible = [];
-  for (const attachment of images.slice(0, 3)) {
-    const number = attachments.indexOf(attachment) + 1;
+  const overflow = [];
+  const nativeOverflow = [];
+  const helperOverflow = [];
+  let nativeBytes = 0;
+  let descriptionBytes = 0;
+  let position = 0;
+  for (const [index, attachment] of images.entries()) {
+    const number = attachments.indexOf(attachment, position) + 1;
+    position = number;
+    if (index >= maxPictures) { overflow.push(number); continue; }
     const format = {number, declared_type:typeof attachment.content_type === 'string' ? attachment.content_type : null, detected_type:null};
     formats.push(format);
     if (attachment.size > limit) oversized.push(number);
@@ -191,8 +203,18 @@ export async function imageNote({ ctx, account, channel, input, images, attachme
           const image = await discordImage(attachment, channel, timeout, download, limit);
           timeout.throwIfAborted();
           format.detected_type = image.mimeType;
-          if (direct && image.data.length <= hostImageLimitMiB * 1024 * 1024) native.push({number, image});
-          else forDescription.push({number, image});
+          const size = image.data.byteLength;
+          if (direct && size <= hostImageLimitMiB * 1024 * 1024 && nativeBytes + size <= nativeTotalBytes) {
+            native.push({number, image});
+            nativeBytes += size;
+          } else if (!model) {
+            nativeOverflow.push(number);
+          } else if (descriptionBytes + size > descriptionTotalBytes) {
+            helperOverflow.push(number);
+          } else {
+            forDescription.push({number, image});
+            descriptionBytes += size;
+          }
         } catch (error) {
           signal.throwIfAborted();
           if (error instanceof ImageSizeError) oversized.push(number);
@@ -243,6 +265,16 @@ export async function imageNote({ ctx, account, channel, input, images, attachme
     notices.push(detail + '，请转成 PNG、JPEG 或 WebP 后重发。');
     unavailable.push(detail + '，内容未知。');
   }
+  for (const [numbers, reason] of [
+    [overflow, '超过每条消息 ' + maxPictures + ' 张的数量上限'],
+    [nativeOverflow, '超出本条消息原图直看的 16 MiB 总上限'],
+    [helperOverflow, '超出本条消息辅助转述的 96 MiB 总上限']
+  ]) {
+    if (!numbers.length) continue;
+    const detail = numbers.map(n => '图' + n).join('、') + reason;
+    notices.push(detail + '，请分条重发这些图。');
+    unavailable.push(detail + '，内容未知。');
+  }
   if (unavailable.length) {
     const summary = '【附件状态】' + unavailable.join('');
     if (state === 'done') note += (note ? '\n' : '') + summary;
@@ -253,7 +285,9 @@ export async function imageNote({ ctx, account, channel, input, images, attachme
     note += '\n【附件状态】' + detail + '。这些图片未送入识图模型，内容未知。';
     notices.push(detail + '。请单独重发相应的图片。');
   }
-  if (images.length > 3) note += '（共 ' + images.length + ' 张图片附件，本次取前 3 张。）';
+  if (state === 'failed' && forDescription.length > 1) {
+    note = forDescription.map(p => '图' + p.number).join('、') + '：' + note;
+  }
   signal.throwIfAborted();
   const record = {state, finish_reason:finishReason, note, attachments:formats};
   if (native.length) record.direct = native.map(({number, image}) => ({

@@ -34,7 +34,7 @@ test('独立宿主进程：配置、网页续聊、频道/讨论串隔离、多�
   const folder = join(root, 'plugins/discord');
   await mkdir(folder, { recursive: true });
   await mkdir(join(root, 'config'));
-  for (const name of ['plugin.yaml', 'package.json', 'index.ts', 'plugin.mjs', 'images.mjs', 'commands.mjs', 'vision.mjs', 'receipts.mjs', 'transport.mjs', 'settings.mjs', 'settings-theme.mjs'])
+  for (const name of ['plugin.yaml', 'package.json', 'index.ts', 'plugin.mjs', 'incoming-turns.mjs', 'images.mjs', 'commands.mjs', 'vision.mjs', 'receipts.mjs', 'transport.mjs', 'settings.mjs', 'settings-theme.mjs'])
     await copyFile(join(source, name), join(folder, name));
   await cp(join(source, 'node_modules'), join(folder, 'node_modules'), { recursive: true });
   const config = JSON.parse(await readFile(join(host, 'config.example.json'), 'utf8'));
@@ -63,7 +63,7 @@ test('独立宿主进程：配置、网页续聊、频道/讨论串隔离、多�
   let app, cookie, url;
   const calls = [], visionRequests = [], nativeCalls = [];
   const modelHttp = await import(pathToFileURL(join(host, 'core/model-http.ts')));
-  let nativeError;
+  let nativeError, blockNextChat;
   async function open() {
     app = await boot(root);
     assert.equal(app.runtime.records.get('discord')?.status, 'active', app.runtime.records.get('discord')?.error);
@@ -79,6 +79,11 @@ test('独立宿主进程：配置、网页续聊、频道/讨论串隔离、多�
         return { text:'模拟图像观察：红色标记', toolCalls:[], usage:{} };
       }
       calls.push(input.messages.map(m => m.content).join('\n'));
+      if (blockNextChat) {
+        const gate = blockNextChat;
+        blockNextChat = undefined;
+        await gate;
+      }
       return { text: '模拟回复', toolCalls: [], usage: { prompt_tokens: 15, completion_tokens: 4 } };
     };
     url = 'http://127.0.0.1:' + app.web.server.address().port;
@@ -91,6 +96,9 @@ test('独立宿主进程：配置、网页续聊、频道/讨论串隔离、多�
   assert.equal((await fetch(url + settings)).status, 401);
   const freshSettings = await (await request(settings)).text();
   assert.match(freshSettings, /连接已关闭/);
+  assert.match(freshSettings, /name="dmDebounce" type="checkbox" checked/);
+  assert.match(freshSettings, /name="channelMerge" type="checkbox" checked/);
+  assert.match(freshSettings, /name="dmQuietMs"[^>]+value="600"/);
   assert.match(freshSettings, /value="auto" selected>自动（优先直看）/);
   assert.equal((await request('/plugins/discord/save', { revision:'', enabled:'on', persona:'whale', owner:'123' })).status, 400);
   await app.close();
@@ -133,7 +141,7 @@ test('独立宿主进程：配置、网页续聊、频道/讨论串隔离、多�
   await writeFile(configFile, JSON.stringify({imageModel:'chat'}));
   await open();
   assert.match(await (await request(settings)).text(), /value="describe" selected>始终转述/);
-  const save = { revision: '', enabled:'on', token:'offline-only-synthetic-token', persona:'whale', imageModel:'chat', owner, channels:channel+'\n'+thread };
+  const save = { dmQuietMs:'600', revision: '', enabled:'on', token:'offline-only-synthetic-token', persona:'whale', imageModel:'chat', owner, channels:channel+'\n'+thread };
   const saved = await request('/plugins/discord/save', save);
   assert.equal(saved.status, 303, await saved.text());
   const html = await (await request(settings)).text();
@@ -273,7 +281,7 @@ test('独立宿主进程：配置、网页续聊、频道/讨论串隔离、多�
   const after = (await service().sent()).length;
   const threadImage = {...media, id:fresh(45), guild_id:server, channel_id:thread, type:19,
     message_reference:{message_id:imgId,channel_id:thread}, referenced_message:{id:imgId,channel_id:thread,author:{id:bot},content:'对比一下？'},
-    attachments:[1,2,3].map(() => ({...media.attachments[0],filename:'image.png',content_type:'image/webp',url:media.attachments[0].url.replace(dmChannel,thread)}))};
+    attachments:Array.from({length:9}).map(() => ({...media.attachments[0],filename:'image.png',content_type:'image/webp',url:media.attachments[0].url.replace(dmChannel,thread)}))};
   const secondThreadMessage = {...threadImage, id:fresh(47), content:'补充一下，先看第一张', attachments:[]};
   await send(threadImage);
   await send(secondThreadMessage);
@@ -281,7 +289,7 @@ test('独立宿主进程：配置、网页续聊、频道/讨论串隔离、多�
   const ordered = (await service().sent()).slice(after).map(item=>item.body.message_reference.message_id);
   assert.deepEqual(ordered,[threadImage.id,secondThreadMessage.id]);
   assert.equal((await service().sent()).at(-1).path, '/channels/'+thread+'/messages');
-  assert.equal(visionRequests.at(-1).messages[1].content.filter(p=>p.type==='image_url').length, 3);
+  assert.equal(visionRequests.at(-1).messages[1].content.filter(p=>p.type==='image_url').length, 9);
   assert.ok(visionRequests.at(-1).messages[1].content.filter(p=>p.type==='image_url').every(p=>p.image_url.url.startsWith('data:image/png;base64,')));
   assert.match(calls.at(-1), /【图片转述】/);
   await invoke('pause', thread, '16', /已暂停/);
@@ -399,5 +407,77 @@ test('独立宿主进程：配置、网页续聊、频道/讨论串隔离、多�
     await setAuto('');
     assert.match(await sendAndRead({...media,id:fresh(85)}), /宿主需要辅助模型/);
   }
+
+  const policy = {...save, dmQuietMs:'300', dmDebounce:'on', channelMerge:'on', imageMode:'auto', imageModel:'vision', imageReasoning:'model'};
+  for (const bad of ['', '99', '101.5', '5001', 'hello']) {
+    assert.equal((await request('/plugins/discord/save', {...policy, revision:await revision(), dmQuietMs:bad})).status,400);
+  }
+  assert.equal((await request('/plugins/discord/save', {...policy, revision:await revision()})).status,303);
+  await app.close(); await open();
+  const preferences = await (await request(settings)).text();
+  assert.match(preferences,/name="dmQuietMs"[^>]+value="300"/);
+  let chatBefore = calls.length;
+  const burst = ['分段甲','分段乙','分段丙'].map((content,i) => ({...dm,id:fresh(100+i),content}));
+  for (const packet of burst) {
+    await send(packet);
+    await delay(115);
+    assert.equal(calls.length,chatBefore);
+  }
+  await until(async () => (await service().sent()).length === 1);
+  assert.equal(calls.length,chatBefore + 1);
+  assert.match(calls.at(-1),/分段甲[\s\S]*分段乙[\s\S]*分段丙/);
+  assert.equal((await service().sent())[0].body.message_reference.message_id,burst[0].id);
+
+  // Replay a merged member by itself after restart, followed by a genuinely new message.
+  await app.close(); await open();
+  chatBefore = calls.length;
+  await send(burst[1]);
+  await send({...dm,id:fresh(104),content:'下一问'});
+  await until(async () => (await service().sent()).length === 1);
+  assert.equal(calls.length,chatBefore + 1);
+  assert.match(calls.at(-1),/下一问/);
+
+  const beforePhoto = (await service().sent()).length;
+  const beforeAux = visionRequests.length;
+  const beforeNative = nativeCalls.length;
+  await send({...media,id:fresh(105),attachments:Array.from({length:9}, () => ({...media.attachments[0]}))});
+  await delay(80);
+  await send({...dm,id:fresh(106),content:'只看右下角'});
+  await until(async () => (await service().sent()).length === beforePhoto+1);
+  if (modelHttp.ModelImageInputUnsupportedError) {
+    assert.equal(nativeCalls.length, beforeNative+1);
+    assert.equal(nativeCalls.at(-1).messages.flatMap(m=>Array.isArray(m.content)?m.content:[]).filter(p=>p.type==='image_url').length,9);
+    assert.ok(nativeCalls.at(-1).messages.some(m => typeof m.content === 'string' && m.content.includes('只看右下角')));
+  } else {
+    assert.equal(visionRequests.length,beforeAux+1);
+    assert.match(visionRequests.at(-1).messages[1].content[0].text,/只看右下角/);
+  }
+
+  // A channel starts without the private timer. Keep generation open while a supplement arrives.
+  let releaseChat;
+  blockNextChat = new Promise(resolve => { releaseChat = resolve; });
+  const beforeChannel = (await service().sent()).length;
+  chatBefore = calls.length;
+  const head = {...group,id:fresh(110),content:'<@'+bot+'> 开始频道测试'};
+  const follow = {...head,id:fresh(111),content:'<@'+bot+'> 再补一句'};
+  await send(head);
+  await until(() => calls.length > chatBefore);
+  await send(follow);
+  await delay(150);
+  releaseChat();
+  await until(async () => (await service().sent()).length === beforeChannel + 1);
+  assert.match(calls.at(-1),/再补一句/);
+  assert.equal((await service().sent()).at(-1).body.message_reference.message_id,head.id);
+
+  // Saving only the duration must not tear down a waiting DM or reset the client.
+  const beforeSave = (await service().sent()).length;
+  chatBefore = calls.length;
+  await send({...dm,id:fresh(114),content:'调时间之前'});
+  assert.equal((await request('/plugins/discord/save', {...policy, revision:await revision(), dmQuietMs:'120'})).status,303);
+  await send({...dm,id:fresh(115),content:'调时间之后'});
+  await until(async () => (await service().sent()).length === beforeSave + 1);
+  assert.equal(calls.length,chatBefore+1);
+  assert.match(calls.at(-1),/调时间之前[\s\S]*调时间之后/);
+  assert.match(await (await request(settings)).text(),/name="dmQuietMs"[^>]+value="120"/);
 
 });

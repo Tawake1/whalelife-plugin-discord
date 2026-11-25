@@ -23,19 +23,19 @@ function fixture() {
     }
   };
 }
-test('图片问题送到所选模型，识别结果可重用，按顺序发送前三张', async () => {
+test('图片问题送到所选模型，识别结果可重用，按顺序发送九张', async () => {
   const f = fixture();
-  f.args.images = ['a','b','c','d'].map(name=>({...attachment, url:prefix+name+'.png'}));
+  f.args.images = 'abcdefghi'.split('').map(name=>({...attachment, url:prefix+name+'.png'}));
   const {note} = await imageNote(f.args);
-  assert.match(note, /真实见到的文字/); assert.match(note, /前 3 张/);
-  assert.deepEqual(f.calls[0].messages[1].content.filter(p=>p.type==='text').slice(1).map(p=>p.text), ['图1','图2','图3']);
-  assert.deepEqual(f.requests.map(r=>r.url.pathname.split('/').pop()), ['a.png','b.png','c.png']);
+  assert.match(note, /真实见到的文字/);
+  assert.deepEqual(f.calls[0].messages[1].content.filter(p=>p.type==='text').slice(1).map(p=>p.text), Array.from({length:9}, (_,i) => '图'+(i+1)));
+  assert.deepEqual(f.requests.map(r=>r.url.pathname.split('/').pop()), 'abcdefghi'.split('').map(c=>c+'.png'));
   assert.equal(f.calls[0].model, 'chosen-model');
   assert.match(f.calls[0].messages[1].content[0].text, /图片上写了什么/);
   assert.equal(f.calls[0].messages[1].content[2].image_url.url, 'data:image/png;base64,'+png.toString('base64'));
   assert.equal(f.requests[0].options.redirect, 'error');
   assert.equal((await imageNote(f.args)).note, note);
-  assert.equal(f.calls.length, 1); assert.equal(f.requests.length, 3);
+  assert.equal(f.calls.length, 1); assert.equal(f.requests.length, 9);
   assert.doesNotMatch(JSON.stringify([...f.state.values()]), /cdn\.discordapp|base64|iVBOR/);
 });
 test('错误频道、外站及超限图片均不调用模型', async () => {
@@ -336,4 +336,39 @@ test('纯原图不添加占位文字，辅助模型失败仍直传同条可用�
   assert.match(result.note,/图2转述失败/);
   assert.equal(result.retryable,false);
   assert.equal(result.native.length,1);
+});
+
+test('直看总量已满的原图按原号转述或单独提示，其余小图继续直看', async () => {
+  for (const model of ['', 'helper']) {
+    const f = fixture();
+    Object.assign(f.args,{direct:true, model,limitMiB:8});
+    const sizes = [4,4,4,3,2,1].map(n => n*1024*1024);
+    f.args.images = sizes.map((size,i) => ({...attachment,size,url:prefix+i+'.png'}));
+    const notices=[];
+    f.args.sendAttachmentNotice=async note => notices.push(note);
+    f.args.download=async url=>new Response(Buffer.concat([png],sizes[Number(url.pathname.split('/').pop().split('.')[0])]));
+    const result=await imageNote(f.args);
+    assert.deepEqual(result.native.map(p=>p.number),[1,2,3,4,6]);
+    if (model) {
+      assert.deepEqual(f.calls[0].messages[1].content.filter(p=>p.type==='text').slice(1).map(p=>p.text),['图5']);
+      assert.deepEqual(notices,[]);
+    } else {
+      assert.match(notices[0],/图5.*16 MiB/);
+      assert.equal(f.calls.length,0);
+    }
+  }
+});
+
+test('超出张数时告知 Discord 原附件序号，重复投递复用提示', async () => {
+  const f = fixture();
+  f.args.images = Array.from({length:11},(_,i)=>({...attachment,url:prefix+i+'.png'}));
+  f.args.attachments = [{filename:'readme.txt'},...f.args.images];
+  const notices=[];
+  f.args.sendAttachmentNotice=async note=>notices.push(note);
+  const result=await imageNote(f.args);
+  assert.equal(f.requests.length,10);
+  assert.match(result.note,/图12超过每条消息 10 张/);
+  await imageNote(f.args);
+  assert.equal(notices.length,1);
+  assert.match(notices[0],/图12.*分条重发/);
 });

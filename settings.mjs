@@ -6,6 +6,7 @@ import { defaultImageLimitMiB, hostImageLimitMiB, imageLimitFor, maxImageLimitMi
 import { appearanceScript, scriptHash, themeStyles } from './settings-theme.mjs';
 
 const base = '/plugins/discord';
+import { defaultQuietMs, minQuietMs, maxQuietMs } from './incoming-turns.mjs';
 const sections = [
   ['connection', 'Bot 连接', '<rect x="4" y="6" width="16" height="13" rx="4"/><path d="M12 6V3M8 12h.01M16 12h.01M9 15h6"/>'],
   ['access', '消息接收', '<path d="M20 11a8 8 0 0 1-8 8H8l-5 2 1.5-5A8 8 0 1 1 20 11Z"/>'],
@@ -179,6 +180,11 @@ export function setupPage(ctx, api) {
     <small id="owner-help">留空关闭私信。在 Discord 开启开发者模式后，右键用户头像即可复制 ID。</small></div></div>
     <div class="field"><label for="channels">频道或讨论串 ID</label><div><textarea id="channels" name="channels" rows="3" aria-describedby="channels-help">${escape(Array.isArray(c.channels) ? c.channels.join('\n') : '')}</textarea>
     <small id="channels-help">每行一个 ID。在允许的频道中，@ Bot 或回复它的消息即可对话。</small></div></div>
+    <label class="check"><input name="dmDebounce" type="checkbox" ${c.dmDebounce ? 'checked':''}>私信：等我说完再回</label>
+    <div class="field"><label for="dmQuietMs">私信等待时间（毫秒）</label><div><input id="dmQuietMs" name="dmQuietMs" type="number" required min="${minQuietMs}" max="${maxQuietMs}" step="1" value="${escape(c.dmQuietMs)}" aria-describedby="quiet-help">
+    <small id="quiet-help">默认 ${defaultQuietMs} 毫秒。每条新私信都会重新计时，关闭后逐条回复。</small></div></div>
+    <label class="check"><input name="channelMerge" type="checkbox" ${c.channelMerge ? 'checked':''}>频道与讨论串：合并同一人的追发</label>
+    <small>首条立即处理；后续消息仍须 @ Bot 或回复 Bot。</small>
     <label class="check"><input name="inheritThreads" type="checkbox" ${c.inheritThreads ? 'checked':''}>允许上述频道下的讨论串</label>
     <label class="check"><input name="replyIntent" type="checkbox" aria-describedby="reply-help" ${c.replyIntent ? 'checked':''}>接收回复 Bot 时未 @ 它的消息</label>
     <p class="help" id="reply-help">使用此选项前，请在 Discord Developer Portal → Bot 开启 Message Content Intent。</p></div></section>
@@ -186,11 +192,11 @@ export function setupPage(ctx, api) {
     <div class="field"><label for="imageMode">图片处理方式</label><select id="imageMode" name="imageMode">
     ${[['auto','自动（优先直看）'],['describe','始终转述'],['off','关闭']].map(([v,label]) => '<option value="'+v+'" '+(c.imageMode === v ? 'selected':'')+'>'+label+'</option>').join('')}</select></div>
     <div class="field"><label for="imageModel">辅助识图模型</label><div><select id="imageModel" name="imageModel" aria-describedby="vision-help"><option value="">不使用辅助模型</option>${imageOptions}</select>
-    <small id="vision-help">每条最多处理前 3 张 PNG、JPEG 或 WebP。自动模式在 WhaleLife v0.1.5 起优先把原图交给主模型，直传每张最多 4 MiB。旧宿主、直传超限或主模型明确拒绝图片时，可用所选辅助模型转述。</small></div></div>
+    <small id="vision-help">每条最多处理 10 张 PNG、JPEG 或 WebP。自动模式在 WhaleLife v0.1.5 起优先把原图交给主模型，直传每张最多 4 MiB、合计最多 16 MiB。旧宿主、直传超限或主模型明确拒绝图片时，可用所选辅助模型转述。</small></div></div>
     <div class="field"><label for="imageReasoning">识图思考模式</label><select id="imageReasoning" name="imageReasoning">
     ${[['auto','自动（DeepSeek Flash 尝试关闭）'],['none','尝试关闭'],['model','跟随模型设置']].map(([value,label]) => '<option value="'+value+'" '+(c.imageReasoning === value ? 'selected':'')+'>'+label+'</option>').join('')}</select></div>
     <div class="field"><label for="imageTimeout">每轮超时（秒）</label><input id="imageTimeout" name="imageTimeout" type="number" min="30" max="300" required value="${escape(c.imageTimeout)}"></div>
-    </div></section><div class="actions connection-actions"><button class="primary">保存连接设置</button><small>保存连接、消息接收和识图设置。启用连接时会重连 Bot。</small></div></form>
+    </div></section><div class="actions connection-actions"><button class="primary">保存连接设置</button><small>保存连接、消息接收和识图设置。单独调整连发策略或等待时间会直接生效。</small></div></form>
     <section id="image-limits">${heading('image-limits')}
     <p class="help" id="limits-info">选择辅助模型后，此上限也适用于直传。每个模型单独保存，立即对新消息生效。默认 ${defaultImageLimitMiB} MiB，可设 0.1 至 ${maxImageLimitMiB} MiB。</p>
     ${limitForms || '<p>请先在 WhaleLife 添加并启用识图模型。</p>'}</section>
@@ -218,6 +224,9 @@ export function setupPage(ctx, api) {
       await api.save(f.revision, { enabled: f.enabled === 'on', persona: f.persona, imageModel: f.imageModel || '',
         imageMode: f.imageMode ?? (f.imageModel ? 'describe' : 'off'),
         imageTimeout: Number(f.imageTimeout ?? 120), imageReasoning: f.imageReasoning || 'auto',
+        dmQuietMs: Number(f.dmQuietMs ?? api.state().config.dmQuietMs ?? defaultQuietMs),
+        dmDebounce: f.dmQuietMs === undefined ? api.state().config.dmDebounce : f.dmDebounce === 'on',
+        channelMerge: f.dmQuietMs === undefined ? api.state().config.channelMerge : f.channelMerge === 'on',
         replyIntent: f.replyIntent === 'on', inheritThreads: f.inheritThreads === 'on',
         owner: (f.owner || '').trim(), channels: [...new Set((f.channels || '').trim().split(/[\s,，]+/).filter(Boolean))],
         token: (f.token || '').trim() });

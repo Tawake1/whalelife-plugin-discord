@@ -1,15 +1,17 @@
 /*! Copyright (c) 2026 WhaleLife Discord plugin contributors.
  * SPDX-License-Identifier: AGPL-3.0-only. See LICENSE-ADDITIONAL.
  */
+import { isDeepStrictEqual } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { Events } from 'discord.js';
 import { allowedChannel, deliver, incoming, snowflake, startImageTyping } from './transport.mjs';
 import { registerCommand, handleCommand } from './commands.mjs';
 import { attachmentHint, describePictures, hostImageLimitMiB, imageAttachments, imageLimitFor, imageNote, maxImageLimitMiB, validImageLimit } from './images.mjs';
 import { expiredImage, scheduleReceiptCleanup } from './receipts.mjs';
+import { incomingTurns, defaultQuietMs, minQuietMs, maxQuietMs } from './incoming-turns.mjs';
 import { setupPage } from './settings.mjs';
 
-const defaults = { enabled: false, token: '', owner: '', channels: [], pausedRoutes: [], inheritThreads: false, replyIntent: false, imageReasoning: 'auto', imageTimeout: 120, imageModel: '', imageMode: 'auto', imageLimitsMiB: {}, persona: 'whale', revision: '' };
+const defaults = { enabled: false, dmDebounce:true, dmQuietMs:defaultQuietMs, channelMerge:true, token: '', owner: '', channels: [], pausedRoutes: [], inheritThreads: false, replyIntent: false, imageReasoning: 'auto', imageTimeout: 120, imageModel: '', imageMode: 'auto', imageLimitsMiB: {}, persona: 'whale', revision: '' };
 
 export function validate(config) {
   if (typeof config.enabled !== 'boolean' || typeof config.persona !== 'string' || !config.persona.trim() ||
@@ -31,7 +33,9 @@ export function validate(config) {
     throw Error('识图超时可设置为 30 至 300 秒。');
   if (config.imageReasoning !== undefined && !['auto','none','model'].includes(config.imageReasoning))
     throw Error('请选择有效的识图思考模式。');
-  for (const flag of ['inheritThreads','replyIntent'])
+  if (!Number.isInteger(config.dmQuietMs ?? defaultQuietMs) || (config.dmQuietMs ?? defaultQuietMs) < minQuietMs || (config.dmQuietMs ?? defaultQuietMs) > maxQuietMs)
+    throw Error('私信等待时间须为 ' + minQuietMs + ' 至 ' + maxQuietMs + ' 之间的整数毫秒。');
+  for (const flag of ['inheritThreads','replyIntent','dmDebounce','channelMerge'])
     if (config[flag] !== undefined && typeof config[flag] !== 'boolean') throw Error('频道设置无效。');
   if (config.enabled && (!config.token || !(config.owner || config.channels.length)))
     throw Error('连接前请填写 Bot Token，以及至少一个私信用户或频道 ID。');
@@ -89,11 +93,12 @@ export async function startPlugin(ctx, makeClient, downloadImage = fetch) {
     const client = makeClient(config);
     const run = { client, controller: new AbortController(), account: '', handle: null };
     active = run;
-    // Only hold this ordering barrier until submission to the host, not until its model replies.
-    run.preparing = new Map();
     let activeImages = 0;
     const nativeQuestions = new Map();
     const signal = AbortSignal.any([ctx.signal, run.controller.signal]);
+    run.turns = incomingTurns(() => run.handle, signal, () => {
+      if (!signal.aborted) ctx.logger.warn('Discord 来信处理未完成');
+    });
     const current = config;
     status = attempt ? '正在重试登录（' + attempt + '/' + loginRetrySeconds.length + '）' : '正在连接';
     const setStatus = value => { if (!signal.aborted) status = value; };
@@ -183,11 +188,10 @@ export async function startPlugin(ctx, makeClient, downloadImage = fetch) {
         const sendImageStatus = (text, kind = 'status') => deliver(client.rest, {account: run.account, peer: input.peer, text,
           replyTo: input.messageId, deliveryId: 'discord-image-' + kind + ':' + input.messageId}, current, run.account, signal, client.channels);
         if (run.handle.supportsSenderProfile !== true) delete input.senderProfile;
-        const preceding = run.preparing.get(input.peer);
-        let receipt;
         let fallbackContext;
-        if (images.length || hint || checkParent || preceding) {
-          const submit = async () => {
+        const mode = packet.d.guild_id ? (config.channelMerge ? 'live' : 'single') : (config.dmDebounce ? 'quiet' : 'single');
+        run.turns.add({input, question:textInput?.text || '',
+          async prepare(batchQuestion) {
             signal.throwIfAborted();
             if (checkParent) {
               const allowed = await allowedChannel(current, packet.d.guild_id, packet.d.channel_id, client.channels);
@@ -204,7 +208,7 @@ export async function startPlugin(ctx, makeClient, downloadImage = fetch) {
               let recognition;
               try {
                 recognition = await imageNote({ctx, account:run.account, channel:packet.d.channel_id,
-                  input, images, attachments:packet.d.attachments, sendAttachmentNotice:text => sendImageStatus(text, 'size'),
+                  input:batchQuestion ? {...input, text:batchQuestion} : input, images, attachments:packet.d.attachments, sendAttachmentNotice:text => sendImageStatus(text, 'size'),
                   model:current.imageModel, direct, limitMiB, reasoning:current.imageReasoning, timeoutSeconds:current.imageTimeout, signal, busy, download:downloadImage,
                   startTyping: () => startImageTyping(client.rest, packet.d.channel_id, signal)});
               } finally { if (!busy) activeImages--; }
@@ -219,37 +223,26 @@ export async function startPlugin(ctx, makeClient, downloadImage = fetch) {
                 const question = textInput?.text || '';
                 input.text = [question, recognition.note].filter(Boolean).join('\n');
                 if (current.imageModel && !nativeQuestions.has(input.messageId)) {
-                  fallbackContext = {numbers:recognition.native.map(p => p.number), question};
+                  fallbackContext = {numbers:recognition.native.map(p => p.number), question:batchQuestion || question};
                   nativeQuestions.set(input.messageId, fallbackContext);
                 }
               } else input.text += '\n' + (recognition.note.startsWith('【图片转述】') ? recognition.note : '【Discord 图片】' + recognition.note);
             }
             signal.throwIfAborted();
-            try { receipt = run.handle.receive(input, { signal }); }
-            catch (error) {
-              if (fallbackContext) nativeQuestions.delete(input.messageId);
-              throw error;
+            return true;
+          },
+          cleanup() {
+            if (fallbackContext && nativeQuestions.get(input.messageId) === fallbackContext) nativeQuestions.delete(input.messageId);
+          },
+          async finished(result) {
+            if (input.images && result.status === 'generation_failed' && !result.duplicate && !signal.aborted) {
+              await sendImageStatus(current.imageModel ? '本次主模型未能完成看图，请稍后重发或切到「始终转述」。'
+                : '本次主模型未能完成看图。可选择辅助识图模型，以便主模型明确不支持图片时转述。');
             }
-            // Mark a synchronous rejection as observed while releasing the ordering barrier.
-            Promise.resolve(receipt).catch(() => {});
-          };
-          const queued = (preceding || Promise.resolve()).catch(() => {}).then(submit);
-          run.preparing.set(input.peer, queued);
-          try { await queued; }
-          finally { if (run.preparing.get(input.peer) === queued) run.preparing.delete(input.peer); }
-        } else receipt = run.handle.receive(input, { signal });
-        if (!receipt) return;
-        let result;
-        try { result = await receipt; }
-        finally {
-          if (fallbackContext && nativeQuestions.get(input.messageId) === fallbackContext) nativeQuestions.delete(input.messageId);
-        }
-        if (input.images && result.status === 'generation_failed' && !result.duplicate && !signal.aborted) {
-          await sendImageStatus(current.imageModel ? '本次主模型未能完成看图，请稍后重发或切到「始终转述」。'
-            : '本次主模型未能完成看图。可选择辅助识图模型，以便主模型明确不支持图片时转述。');
-        }
-        if (result.status !== 'sent' && !signal.aborted)
-          ctx.logger.warn('Discord 消息未完成', { messageId: input.messageId, status: result.status });
+            if (result.status !== 'sent' && !signal.aborted)
+              ctx.logger.warn('Discord 消息未完成', { messageId: input.messageId, status: result.status });
+          }
+        }, mode, config.dmQuietMs);
       }
     }
     client.on(Events.Raw, packet => {
@@ -315,9 +308,14 @@ export async function startPlugin(ctx, makeClient, downloadImage = fetch) {
       if (next.imageMode !== 'off' && next.imageModel && !ctx.models.list('chat').some(m => m.id === next.imageModel && m.callable))
         throw Error('请选择已启用、支持图像输入的对话模型。');
       if (!ctx.personas.list().some(p => p.id === next.persona)) throw Error('请选择已存在的人格。');
+      // Timing changes take effect on new arrivals without cancelling an in-flight message.
+      const policyKeys = ['dmQuietMs','dmDebounce','channelMerge'];
+      const policyChanged = policyKeys.some(key => next[key] !== config[key]);
+      const reconnect = !policyChanged || Object.keys(next).some(key => key !== 'revision' && !policyKeys.includes(key)
+        && !isDeepStrictEqual(next[key], config[key]));
       await ctx.config.save('config.json', next);
       config = next;
-      await restart();
+      if (reconnect) await restart();
     }),
     saveImageLimit: (revision, model, limitMiB) => serial(async () => {
       if (revision !== config.revision) throw Error('配置已变更，请刷新后再保存。');
@@ -330,7 +328,7 @@ export async function startPlugin(ctx, makeClient, downloadImage = fetch) {
       if (!active?.handle || !config.owner) throw Error('请先连接 Bot 并设置私信用户。');
       if (form.revision !== config.revision || form.account !== active.account) throw Error('连接或配置已变更，请刷新。');
       const peer = 'dm:' + config.owner;
-      if (active.preparing.has(peer)) throw Error('私信图片处理中，请稍后重试绑定。');
+      if (active.turns.busy(peer)) throw Error('私信等待或处理中，请稍后重试绑定。');
       if (action === 'preview') {
         return { old: (await active.handle.context(peer)).id, target: await ctx.sessions.current() };
       }

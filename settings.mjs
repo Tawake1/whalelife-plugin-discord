@@ -1,7 +1,7 @@
 /*! Copyright (c) 2026 WhaleLife Discord plugin contributors.
  * SPDX-License-Identifier: AGPL-3.0-only. See LICENSE-ADDITIONAL.
  */
-import { defaultImageLimitMiB, imageLimitFor, maxImageLimitMiB } from './images.mjs';
+import { defaultImageLimitMiB, hostImageLimitMiB, imageLimitFor, maxImageLimitMiB } from './images.mjs';
 
 import { appearanceScript, scriptHash, themeStyles } from './settings-theme.mjs';
 
@@ -29,7 +29,7 @@ function hidden(name, value) {
 }
 function page(res, content, status = 200, detail = true, start = 'connection') {
   res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store',
-    'Content-Security-Policy': `default-src 'none'; script-src 'sha256-${scriptHash}'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'` });
+    'Content-Security-Policy': `default-src 'none'; script-src 'sha256-${scriptHash}'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; base-uri 'none'` });
   res.end(`<!DOCTYPE html><html lang="zh-CN" data-theme="discord"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Discord 设置</title><script>${appearanceScript}</script><style>
 :root {
@@ -132,9 +132,15 @@ async function fields(req) {
 }
 const back = '<p><a href="' + base + '/settings">返回 Discord 设置</a></p>';
 
+function json(res, payload, status = 200) {
+  res.writeHead(status, {'Content-Type':'application/json; charset=utf-8', 'Cache-Control':'no-store'});
+  res.end(JSON.stringify(payload));
+}
+
 export function setupPage(ctx, api) {
+  ctx.web.page(base + '/status', (_req, res) => json(res, api.connectionState()));
   ctx.web.page(base + '/settings', (_req, res) => {
-    const { config: c, status, lastError, personas, account, imageModels } = api.state();
+    const { config: c, status, lastError, online, personas, account, imageModels } = api.state();
     const options = personas.map(p => '<option value="' + escape(p.id) + '"' +
       (p.id === c.persona ? ' selected' : '') + '>' + escape(p.name) + '</option>').join('');
     const imageOptions = imageModels.map(m => '<option value="' + escape(m.id) + '"' +
@@ -151,18 +157,20 @@ export function setupPage(ctx, api) {
     page(res, `<div class="topbar"><button class="menu" type="button" aria-expanded="false" aria-controls="settings-nav">导航</button>
     <span class="crumb">插件管理 › Discord</span>
     <div class="chooser" role="group" aria-label="外观"><button type="button" data-choice="swiss">瑞士风</button><button type="button" data-choice="discord">Discord 风</button></div></div><header><div class="hero"><div><p class="context">WhaleLife / 插件管理</p><h1>Discord 设置</h1></div><div class="mark" aria-hidden="true"></div></div>
-    <dl class="summary"><div><dt>连接状态 · <a href="${base}/settings">刷新</a></dt><dd role="status" class="${status === '已连接' ? 'online' : ''}">${escape(status)}</dd>
-    ${lastError ? '<dd class="diagnostic"><small>最近一次 · ' + escape(lastError) + '</small></dd>' : ''}
-    <dd><form method="post" action="${base}/reconnect">${hidden('revision', c.revision)}
+    <dl class="summary"><div><dt>连接状态 · <a href="${base}/settings">刷新</a></dt><dd id="connection-status" role="status" class="${online ? 'online' : ''}">${escape(status)}</dd>
+    <dd class="diagnostic" id="connection-diagnostic" ${lastError ? '' : 'hidden'}><small>${lastError ? '最近一次 · ' + escape(lastError) : ''}</small></dd>
+    <dd class="diagnostic" id="connection-feedback" role="status" hidden></dd>
+    <dd><form id="reconnect-form" data-status-url="${base}/status" method="post" action="${base}/reconnect">${hidden('revision', c.revision)}
     <button type="submit" class="reconnect" title="使用已保存的设置重新登录 Discord" ${c.enabled ? '' : 'disabled'}>重新连接</button></form></dd></div>
-    <div><dt>当前识图模型</dt><dd>${activeModel ? escape(activeModel.name) : c.imageModel ? '模型不可用' : '已关闭'}</dd></div>
-    <div><dt>单图上限</dt><dd>${activeModel ? imageLimitFor(c.imageLimitsMiB, activeModel.id) + ' MiB' : '未启用'}</dd></div></dl></header>
+    <div><dt>图片处理</dt><dd>${c.imageMode === 'auto' ? '自动（优先直看）' : c.imageMode === 'off' ? '已关闭' : '始终转述'}</dd>
+    ${activeModel && c.imageMode !== 'off' ? '<dd><small>辅助模型 · '+escape(activeModel.name)+'</small></dd>' : ''}</div>
+    <div><dt>单图上限</dt><dd>${c.imageMode === 'off' ? '未启用' : activeModel ? imageLimitFor(c.imageLimitsMiB, activeModel.id) + ' MiB' : hostImageLimitMiB + ' MiB'}</dd></div></dl></header>
     <div class="layout"><nav id="settings-nav" aria-label="本页设置"><div class="brand"><svg viewBox="0 0 40 40" aria-hidden="true"><path fill="currentColor" d="M6 18c1 1 2 2 5 2 2-5 6-8 12-8 7 0 11 5 11 11 0 5-5 9-13 9-7 0-13-4-13-9-4-1-5-4-5-7l3 2Z"/><circle cx="27" cy="20" r="1.5" fill="#4b48ad"/><path d="M21 9c0-3 2-4 3-5m-4 5c-1-2-2-3-4-3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg><div><b>WhaleLife</b><small>插件设置</small></div></div><p class="nav-title">本页设置</p>
       ${sections.map(([id,label,path]) => '<a href="#' + id + '">' + icon(path) + label + '</a>').join('')}</nav>
     <div class="panels"><form method="post" action="${base}/save">${stamp}
     <section id="connection">${heading('connection')}<div class="card">
     <label class="check"><input name="enabled" type="checkbox" ${c.enabled ? 'checked' : ''}>启用 Discord 连接</label>
-    ${account ? '<p class="help">Bot ID · <code>' + escape(account) + '</code></p>' : ''}
+    <p class="help" id="bot-account" ${account ? '' : 'hidden'}>Bot ID · <code>${escape(account)}</code></p>
     <div class="field"><label for="token">Bot Token</label><div><input id="token" type="password" name="token" maxlength="512" autocomplete="new-password" aria-describedby="token-help">
     <small id="token-help">${c.token ? '已保存 Token。留空可继续使用，填写新值会替换。' : '从 Discord Developer Portal 的 Bot 页面复制 Token。'}</small></div></div>
     <div class="field"><label for="persona">聊天人格</label><select id="persona" name="persona">${options}</select></div></div></section>
@@ -175,20 +183,22 @@ export function setupPage(ctx, api) {
     <label class="check"><input name="replyIntent" type="checkbox" aria-describedby="reply-help" ${c.replyIntent ? 'checked':''}>接收回复 Bot 时未 @ 它的消息</label>
     <p class="help" id="reply-help">使用此选项前，请在 Discord Developer Portal → Bot 开启 Message Content Intent。</p></div></section>
     <section id="vision">${heading('vision')}<div class="card">
-    <div class="field"><label for="imageModel">图片识别模型</label><div><select id="imageModel" name="imageModel" aria-describedby="vision-help"><option value="">关闭图片识别</option>${imageOptions}</select>
-    <small id="vision-help">每条消息最多取前 3 张图片，支持 PNG、JPEG 和 WebP。模型会结合问题看图，再把文字描述交给鲸鲸。</small></div></div>
+    <div class="field"><label for="imageMode">图片处理方式</label><select id="imageMode" name="imageMode">
+    ${[['auto','自动（优先直看）'],['describe','始终转述'],['off','关闭']].map(([v,label]) => '<option value="'+v+'" '+(c.imageMode === v ? 'selected':'')+'>'+label+'</option>').join('')}</select></div>
+    <div class="field"><label for="imageModel">辅助识图模型</label><div><select id="imageModel" name="imageModel" aria-describedby="vision-help"><option value="">不使用辅助模型</option>${imageOptions}</select>
+    <small id="vision-help">每条最多处理前 3 张 PNG、JPEG 或 WebP。自动模式在 WhaleLife v0.1.5 起优先把原图交给主模型，直传每张最多 4 MiB。旧宿主、直传超限或主模型明确拒绝图片时，可用所选辅助模型转述。</small></div></div>
     <div class="field"><label for="imageReasoning">识图思考模式</label><select id="imageReasoning" name="imageReasoning">
     ${[['auto','自动（DeepSeek Flash 尝试关闭）'],['none','尝试关闭'],['model','跟随模型设置']].map(([value,label]) => '<option value="'+value+'" '+(c.imageReasoning === value ? 'selected':'')+'>'+label+'</option>').join('')}</select></div>
     <div class="field"><label for="imageTimeout">每轮超时（秒）</label><input id="imageTimeout" name="imageTimeout" type="number" min="30" max="300" required value="${escape(c.imageTimeout)}"></div>
     </div></section><div class="actions connection-actions"><button class="primary">保存连接设置</button><small>保存连接、消息接收和识图设置。启用连接时会重连 Bot。</small></div></form>
     <section id="image-limits">${heading('image-limits')}
-    <p class="help" id="limits-info">每个模型单独保存，立即对新消息生效。默认 ${defaultImageLimitMiB} MiB，可设 0.1 至 ${maxImageLimitMiB} MiB。</p>
+    <p class="help" id="limits-info">选择辅助模型后，此上限也适用于直传。每个模型单独保存，立即对新消息生效。默认 ${defaultImageLimitMiB} MiB，可设 0.1 至 ${maxImageLimitMiB} MiB。</p>
     ${limitForms || '<p>请先在 WhaleLife 添加并启用识图模型。</p>'}</section>
     <section id="binding">${heading('binding')}<div class="card">
     <p>可将获准用户的私信接到当前网页会话，或为私信新建独立会话。绑定网页会话后，对方可以和鲸鲸聊到这段会话里的内容。</p>
     <form method="post" action="${base}/binding">${stamp}${hidden('action','preview')}
-    <div class="actions"><button ${!account || !c.owner ? 'disabled' : ''}>查看当前绑定</button>
-    <small>${!account || !c.owner ? '先连接 Bot，并保存允许私信的用户 ID。' : '查看后可确认更改。'}</small></div></form></div></section></div></div>`, 200, false, activeModel && c.enabled ? 'vision' : 'connection');
+    <div class="actions"><button id="binding-preview" ${!account || !c.owner ? 'disabled' : ''}>查看当前绑定</button>
+    <small id="binding-help">${!account || !c.owner ? '先连接 Bot，并保存允许私信的用户 ID。' : '查看后可确认更改。'}</small></div></form></div></section></div></div>`, 200, false, activeModel && c.enabled ? 'vision' : 'connection');
   }, { title: 'Discord 设置', settings: true, navigation: true });
 
   ctx.web.api(base + '/reconnect', async (req, res) => {
@@ -196,13 +206,17 @@ export function setupPage(ctx, api) {
       if (req.method !== 'POST') throw Error('请使用设置页上的重新连接按钮。');
       const f = await fields(req);
       await api.reconnect(f.revision);
+      if (req.headers.accept === 'application/json') return json(res, api.connectionState());
       res.writeHead(303, { Location: base + '/settings', 'Cache-Control': 'no-store' }); res.end();
-    } catch (error) { page(res, '<h1>重新连接失败</h1><p>' + escape(error.message) + '</p>' + back, 409); }
+    } catch (error) {
+      if (req.headers.accept === 'application/json') return json(res, {error:error.message}, 409);
+      page(res, '<h1>重新连接失败</h1><p>' + escape(error.message) + '</p>' + back, 409); }
   });
   ctx.web.api(base + '/save', async (req, res) => {
     try {
       const f = await fields(req);
       await api.save(f.revision, { enabled: f.enabled === 'on', persona: f.persona, imageModel: f.imageModel || '',
+        imageMode: f.imageMode ?? (f.imageModel ? 'describe' : 'off'),
         imageTimeout: Number(f.imageTimeout ?? 120), imageReasoning: f.imageReasoning || 'auto',
         replyIntent: f.replyIntent === 'on', inheritThreads: f.inheritThreads === 'on',
         owner: (f.owner || '').trim(), channels: [...new Set((f.channels || '').trim().split(/[\s,，]+/).filter(Boolean))],

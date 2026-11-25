@@ -66,7 +66,94 @@ function setupAppearance() {
     root.classList.add('interactive');
   });
 }
-export const appearanceScript = '(' + setupAppearance.toString() + ')();';
+function watchConnection() {
+  const form = document.getElementById('reconnect-form');
+  if (!form) return;
+  const button = form.querySelector('button');
+  const status = document.getElementById('connection-status');
+  const diagnostic = document.getElementById('connection-diagnostic');
+  const feedback = document.getElementById('connection-feedback');
+  const account = document.getElementById('bot-account');
+  const binding = document.getElementById('binding-preview');
+  let timer, reading, posting = false;
+
+  function render(state) {
+    if (status.textContent !== state.status) status.textContent = state.status;
+    status.classList.toggle('online', state.online);
+    diagnostic.querySelector('small').textContent = state.lastError ? '最近一次 · ' + state.lastError : '';
+    diagnostic.hidden = !state.lastError;
+    account.querySelector('code').textContent = state.account;
+    account.hidden = !state.account;
+    binding.form.elements.account.value = state.account;
+    binding.disabled = !state.canBind;
+    document.getElementById('binding-help').textContent = state.canBind ? '查看后可确认更改。' : '先连接 Bot，并保存允许私信的用户 ID。';
+    button.disabled = !state.enabled || posting;
+  }
+
+  function message(text) {
+    feedback.textContent = text;
+    feedback.hidden = !text;
+  }
+  function pause() {
+    clearTimeout(timer);
+    reading?.abort();
+  }
+  function schedule(ms) {
+    clearTimeout(timer);
+    if (!posting && !document.hidden) timer = setTimeout(read, ms);
+  }
+  const unavailable = '暂时无法读取连接状态，正在等待恢复。';
+  const unconfirmed = '未能确认重连请求，正在核对连接状态。';
+  async function read() {
+    if (posting || document.hidden) return;
+    pause();
+    const request = new AbortController();
+    reading = request;
+    let delay = 2000;
+    try {
+      const response = await fetch(form.dataset.statusUrl, {cache:'no-store',
+        signal:AbortSignal.any([request.signal, AbortSignal.timeout(8000)])});
+      if (!response.ok) throw Error();
+      const state = await response.json();
+      if (request.signal.aborted) return;
+      render(state);
+      if (feedback.textContent === unavailable || feedback.textContent === unconfirmed) message('');
+      if (state.online || !state.enabled) delay = 10000;
+    } catch {
+      if (!request.signal.aborted && !feedback.textContent) message(unavailable);
+    } finally {
+      if (!request.signal.aborted) schedule(delay);
+    }
+  }
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    if (posting) return;
+    posting = true;
+    pause();
+    button.disabled = true;
+    message('正在请求重新连接…');
+    try {
+      const response = await fetch(form.action, {method:'POST', headers:{Accept:'application/json'},
+        body:new URLSearchParams(new FormData(form)), signal:AbortSignal.timeout(15000)});
+      const state = await response.json();
+      if (!response.ok) { message(state.error || '重新连接请求失败。'); return; }
+      render(state);
+      message('');
+    } catch {
+      message(unconfirmed);
+    } finally {
+      posting = false;
+      button.disabled = false;
+      schedule(0);
+    }
+  });
+  document.addEventListener('visibilitychange', () => document.hidden ? pause() : schedule(0));
+  window.addEventListener('pagehide', pause);
+  window.addEventListener('pageshow', () => schedule(0));
+  schedule(0);
+}
+
+export const appearanceScript = '(' + setupAppearance.toString() + ')();document.addEventListener("DOMContentLoaded",' + watchConnection.toString() + ');';
 export const scriptHash = createHash('sha256').update(appearanceScript).digest('base64');
 
 export const themeStyles = `

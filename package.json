@@ -1,6 +1,6 @@
 {
   "name": "whalelife-plugin-discord",
-  "version": "0.5.8",
+  "version": "0.6.0",
   "description": "WhaleLife 的 Discord 私信与频道文字接入",
   "private": true,
   "type": "module",

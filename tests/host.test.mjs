@@ -61,12 +61,19 @@ test('独立宿主进程：配置、网页续聊、频道/讨论串隔离、多�
   });
   await writeFile(join(root, 'config/config.json'), JSON.stringify(config));
   let app, cookie, url;
-  const calls = [], visionRequests = [];
+  const calls = [], visionRequests = [], nativeCalls = [];
+  const modelHttp = await import(pathToFileURL(join(host, 'core/model-http.ts')));
+  let nativeError;
   async function open() {
     app = await boot(root);
     assert.equal(app.runtime.records.get('discord')?.status, 'active', app.runtime.records.get('discord')?.error);
     app.llm.chat = async input => {
       if (input.messages.some(message => Array.isArray(message.content))) {
+        if (input.privateChannelImages && !input.model) {
+          nativeCalls.push(input);
+          if (nativeError) throw nativeError;
+          return {text:'模拟直接看到了图', toolCalls:[], usage:{}};
+        }
         visionRequests.push(input);
         if (visionRequests.length <= 2) return {text:'主体特征：', finish_reason:'length', toolCalls:[], usage:{}};
         return { text:'模拟图像观察：红色标记', toolCalls:[], usage:{} };
@@ -82,7 +89,9 @@ test('独立宿主进程：配置、网页续聊、频道/讨论串隔离、多�
     ...(form && { method: 'POST', body: new URLSearchParams(form) }) });
   await open(); // Load the unmodified production entry first, with networking disabled by default.
   assert.equal((await fetch(url + settings)).status, 401);
-  assert.match(await (await request(settings)).text(), /连接已关闭/);
+  const freshSettings = await (await request(settings)).text();
+  assert.match(freshSettings, /连接已关闭/);
+  assert.match(freshSettings, /value="auto" selected>自动（优先直看）/);
   assert.equal((await request('/plugins/discord/save', { revision:'', enabled:'on', persona:'whale', owner:'123' })).status, 400);
   await app.close();
   // Swap only the client factory for an in-process Gateway/REST double in the isolated fixture.
@@ -114,7 +123,16 @@ test('独立宿主进程：配置、网页续聊、频道/讨论串隔离、多�
         return client;
       }, async url => url.pathname.endsWith("large.png") ? new Response(Buffer.concat([Buffer.from("89504e470d0a1a0a","hex")], 5 * 1024 * 1024)) : url.pathname.endsWith(".gif") ? new Response("GIF89a") : new Response(Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/96kAAAAASUVORK5CYII=", "base64")));
     }`);
+  // Migrate a saved pre-mode configuration without changing the owner's image preference.
+  await mkdir(join(folder, 'data'), {recursive:true});
+  const configFile = join(folder, 'data/config.json');
+  await writeFile(configFile, JSON.stringify({imageModel:''}));
   await open();
+  assert.match(await (await request(settings)).text(), /value="off" selected>关闭/);
+  await app.close();
+  await writeFile(configFile, JSON.stringify({imageModel:'chat'}));
+  await open();
+  assert.match(await (await request(settings)).text(), /value="describe" selected>始终转述/);
   const save = { revision: '', enabled:'on', token:'offline-only-synthetic-token', persona:'whale', imageModel:'chat', owner, channels:channel+'\n'+thread };
   const saved = await request('/plugins/discord/save', save);
   assert.equal(saved.status, 303, await saved.text());
@@ -123,7 +141,17 @@ test('独立宿主进程：配置、网页续聊、频道/讨论串隔离、多�
   assert.ok(!html.includes(save.token));
   assert.equal((await request('/plugins/discord/save', save)).status, 400);
   const binding = { revision:hidden(html, 'revision'), account:bot };
+  const statusPath = '/plugins/discord/status';
+  assert.equal((await fetch(url + statusPath)).status, 401);
+  const stateResponse = await request(statusPath);
+  assert.equal(stateResponse.headers.get('cache-control'), 'no-store');
+  const state = await stateResponse.json();
+  assert.deepEqual(state, {status:'已连接', lastError:'', online:true, enabled:true, account:bot, canBind:true});
   const reconnectPath = '/plugins/discord/reconnect';
+  const jsonReconnect = await fetch(url + reconnectPath, {method:'POST', redirect:'manual',
+    headers:{Cookie:cookie, Accept:'application/json'}, body:new URLSearchParams({revision:binding.revision})});
+  assert.equal(jsonReconnect.status, 200);
+  assert.equal((await jsonReconnect.json()).enabled, true);
   assert.equal((await request(reconnectPath, {revision:'stale'})).status, 409);
   assert.equal((await request(reconnectPath, {revision:binding.revision})).status, 303);
   assert.equal(hidden(await (await request(settings)).text(), 'revision'), binding.revision);
@@ -323,5 +351,53 @@ test('独立宿主进程：配置、网页续聊、频道/讨论串隔离、多�
   assert.equal(visionCall.model, 'chat');
   const dataUrl = visionCall.messages[1].content.find(part => part.type === 'image_url').image_url.url;
   assert.equal(Buffer.from(dataUrl.split(',')[1], 'base64').length, fiveMiB.size);
+
+  assert.equal((await request(limitPath, {revision:await revision(), model:'vision', limitMiB:'8'})).status, 303);
+  const setAuto = async model => {
+    const response = await request('/plugins/discord/save', {...save, revision:await revision(), imageModel:model, imageMode:'auto', imageReasoning:'model'});
+    assert.equal(response.status, 303, await response.text());
+    await until(async () => (await (await request(statusPath)).json()).online);
+  };
+  const sendAndRead = async packet => {
+    const before = (await service().sent()).length;
+    await send(packet);
+    await until(async () => (await service().sent()).length > before);
+    return (await service().sent()).at(-1).body.content;
+  };
+  await setAuto('vision');
+  const beforeMixed = visionRequests.length;
+  await sendAndRead({...media,id:fresh(81),content:'比较这两张照片',attachments:[media.attachments[0], fiveMiB]});
+  const parts = visionRequests.at(-1).messages[1].content;
+  assert.equal(visionRequests.length,beforeMixed + 1);
+  const labels = parts.filter(p => p.type === 'text').slice(1).map(p => p.text);
+  if (modelHttp.ModelImageInputUnsupportedError) {
+    assert.deepEqual(labels, ['图2']);
+    assert.equal(nativeCalls.length,1);
+    const mixed = nativeCalls[0].messages.find(m => Array.isArray(m.content)).content;
+    assert.equal(mixed.filter(p => p.type === 'image_url').length,1);
+    assert.match(mixed[0].text, /比较这两张照片/);
+    assert.match(mixed[0].text, /【图片转述】/);
+    assert.match(mixed[0].text, /原图依次是图1/);
+
+    nativeError = new modelHttp.ModelImageInputUnsupportedError('unsupported image input');
+    assert.equal(await sendAndRead({...media,id:fresh(82),content:'这个是什么'}), '模拟回复');
+    assert.equal(visionRequests.length,beforeMixed + 2);
+    assert.equal(visionRequests.at(-1).messages[1].content[0].text, '这个是什么');
+    assert.match(calls.at(-1), /渠道辅助识图/);
+    nativeError = Error('429');
+    assert.match(await sendAndRead({...media,id:fresh(83)}), /主模型未能完成看图/);
+    assert.equal(visionRequests.length,beforeMixed + 2);
+    nativeError = undefined;
+    await setAuto('');
+    assert.equal(await sendAndRead({...media,id:fresh(84)}), '模拟直接看到了图');
+    const only = nativeCalls.at(-1).messages.find(m => Array.isArray(m.content)).content;
+    assert.doesNotMatch(only[0].text,/请看看这张图/);
+    assert.equal(visionRequests.length,beforeMixed + 2);
+  } else {
+    assert.deepEqual(labels,['图1','图2']);
+    assert.equal(nativeCalls.length,0);
+    await setAuto('');
+    assert.match(await sendAndRead({...media,id:fresh(85)}), /宿主需要辅助模型/);
+  }
 
 });

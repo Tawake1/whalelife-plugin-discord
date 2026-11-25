@@ -5,11 +5,11 @@ import { randomUUID } from 'node:crypto';
 import { Events } from 'discord.js';
 import { allowedChannel, deliver, incoming, snowflake, startImageTyping } from './transport.mjs';
 import { registerCommand, handleCommand } from './commands.mjs';
-import { attachmentHint, imageAttachments, imageLimitFor, imageNote, maxImageLimitMiB, validImageLimit } from './images.mjs';
+import { attachmentHint, describePictures, hostImageLimitMiB, imageAttachments, imageLimitFor, imageNote, maxImageLimitMiB, validImageLimit } from './images.mjs';
 import { expiredImage, scheduleReceiptCleanup } from './receipts.mjs';
 import { setupPage } from './settings.mjs';
 
-const defaults = { enabled: false, token: '', owner: '', channels: [], pausedRoutes: [], inheritThreads: false, replyIntent: false, imageReasoning: 'auto', imageTimeout: 120, imageModel: '', imageLimitsMiB: {}, persona: 'whale', revision: '' };
+const defaults = { enabled: false, token: '', owner: '', channels: [], pausedRoutes: [], inheritThreads: false, replyIntent: false, imageReasoning: 'auto', imageTimeout: 120, imageModel: '', imageMode: 'auto', imageLimitsMiB: {}, persona: 'whale', revision: '' };
 
 export function validate(config) {
   if (typeof config.enabled !== 'boolean' || typeof config.persona !== 'string' || !config.persona.trim() ||
@@ -19,6 +19,9 @@ export function validate(config) {
   if (config.pausedRoutes !== undefined && (!Array.isArray(config.pausedRoutes) ||
       !config.pausedRoutes.every(key => typeof key === 'string' && /^[1-9]\d{16,19}:[1-9]\d{16,19}$/.test(key))))
     throw Error('频道暂停记录无效。');
+  if (config.imageMode !== undefined && !['auto','describe','off'].includes(config.imageMode))
+    throw Error('请选择有效的图片处理方式。');
+  if (config.imageMode === 'describe' && !config.imageModel) throw Error('始终转述需要先选择图片识别模型。');
   if (config.imageModel !== undefined && (typeof config.imageModel !== 'string' || config.imageModel.length > 200))
     throw Error('图片识别模型 ID 无效。');
   if (config.imageLimitsMiB !== undefined && (!config.imageLimitsMiB || typeof config.imageLimitsMiB !== 'object' ||
@@ -45,7 +48,9 @@ function connectionCode(error) {
 }
 
 export async function startPlugin(ctx, makeClient, downloadImage = fetch) {
-  let config = { ...defaults, ...await ctx.config.read() };
+  const saved = await ctx.config.read();
+  const legacyMode = saved.imageModel ? 'describe' : 'off';
+  let config = { ...defaults, imageMode: Object.keys(saved).length ? legacyMode : 'auto', ...saved };
   let status = '未连接';
   let active;
   let retryTimer;
@@ -87,6 +92,7 @@ export async function startPlugin(ctx, makeClient, downloadImage = fetch) {
     // Only hold this ordering barrier until submission to the host, not until its model replies.
     run.preparing = new Map();
     let activeImages = 0;
+    const nativeQuestions = new Map();
     const signal = AbortSignal.any([ctx.signal, run.controller.signal]);
     const current = config;
     status = attempt ? '正在重试登录（' + attempt + '/' + loginRetrySeconds.length + '）' : '正在连接';
@@ -111,6 +117,22 @@ export async function startPlugin(ctx, makeClient, downloadImage = fetch) {
         if (!run.handle) {
           run.handle = ctx.channels.register({
             id: 'discord', name: 'Discord', account: user.id, persona: current.persona, permission: 'off',
+            ...(current.imageMode === 'auto' && current.imageModel && {
+              async describeImages({messageId, images}, options) {
+                const context = nativeQuestions.get(messageId);
+                if (!context || context.numbers.length !== images.length) throw Error('原图上下文已失效，请重发。');
+                if (activeImages >= 3) throw Error('辅助识图正忙，请稍后重发。');
+                activeImages++;
+                try {
+                  const answer = await describePictures(ctx, {
+                    model:current.imageModel, reasoning:current.imageReasoning, timeoutSeconds:current.imageTimeout,
+                    signal:AbortSignal.any([signal, options.signal])
+                  }, context.question, images.map((image,i) => ({number:context.numbers[i], image})));
+                  if (answer.state !== 'done') throw Error(answer.note);
+                  return answer.note;
+                } finally { activeImages--; }
+              }
+            }),
             send(message, options) {
               return deliver(client.rest, message, current, user.id, AbortSignal.any([signal, options.signal]), client.channels);
             }
@@ -146,10 +168,14 @@ export async function startPlugin(ctx, makeClient, downloadImage = fetch) {
         // Reserve the peer queue before looking up a thread. Inherited routes are
         // checked inside submit, before sending hints, reading images or calling receive.
         const supported = imageAttachments(packet.d);
-        const limitMiB = imageLimitFor(config.imageLimitsMiB, current.imageModel);
-        const images = current.imageModel ? supported : [];
+        const direct = current.imageMode === 'auto' && run.handle.supportsImageInput === true;
+        const canRead = current.imageMode !== 'off' && (direct || Boolean(current.imageModel));
+        const limitMiB = direct && !current.imageModel ? hostImageLimitMiB : imageLimitFor(config.imageLimitsMiB, current.imageModel);
+        const images = canRead ? supported : [];
         if (supported.length && expiredImage(packet.d.id)) return;
-        const hint = attachmentHint(packet.d.attachments, supported, current.imageModel);
+        const hint = supported.length && current.imageMode === 'auto' && !canRead
+          ? '当前宿主需要辅助模型转述图片。请选择图片识别模型，或升级至 WhaleLife v0.1.5 后重发。'
+          : attachmentHint(packet.d.attachments, supported, canRead);
         const textInput = incoming(packet.d, run.account, current, '', listed || checkParent);
         if (!textInput && !images.length && !hint) return;
         const input = textInput ?? incoming(packet.d, run.account, current, '请看看这张图。', listed || checkParent);
@@ -159,6 +185,7 @@ export async function startPlugin(ctx, makeClient, downloadImage = fetch) {
         if (run.handle.supportsSenderProfile !== true) delete input.senderProfile;
         const preceding = run.preparing.get(input.peer);
         let receipt;
+        let fallbackContext;
         if (images.length || hint || checkParent || preceding) {
           const submit = async () => {
             signal.throwIfAborted();
@@ -178,7 +205,7 @@ export async function startPlugin(ctx, makeClient, downloadImage = fetch) {
               try {
                 recognition = await imageNote({ctx, account:run.account, channel:packet.d.channel_id,
                   input, images, attachments:packet.d.attachments, sendAttachmentNotice:text => sendImageStatus(text, 'size'),
-                  model:current.imageModel, limitMiB, reasoning:current.imageReasoning, timeoutSeconds:current.imageTimeout, signal, busy, download:downloadImage,
+                  model:current.imageModel, direct, limitMiB, reasoning:current.imageReasoning, timeoutSeconds:current.imageTimeout, signal, busy, download:downloadImage,
                   startTyping: () => startImageTyping(client.rest, packet.d.channel_id, signal)});
               } finally { if (!busy) activeImages--; }
               if (recognition.skippedAll && !textInput) return;
@@ -187,10 +214,22 @@ export async function startPlugin(ctx, makeClient, downloadImage = fetch) {
                 await sendImageStatus(recognition.note);
                 return;
               }
-              input.text += '\n' + (recognition.note.startsWith('【图片转述】') ? recognition.note : '【Discord 图片】' + recognition.note);
+              if (recognition.native) {
+                input.images = recognition.native.map(p => p.image);
+                const question = textInput?.text || '';
+                input.text = [question, recognition.note].filter(Boolean).join('\n');
+                if (current.imageModel && !nativeQuestions.has(input.messageId)) {
+                  fallbackContext = {numbers:recognition.native.map(p => p.number), question};
+                  nativeQuestions.set(input.messageId, fallbackContext);
+                }
+              } else input.text += '\n' + (recognition.note.startsWith('【图片转述】') ? recognition.note : '【Discord 图片】' + recognition.note);
             }
             signal.throwIfAborted();
-            receipt = run.handle.receive(input, { signal });
+            try { receipt = run.handle.receive(input, { signal }); }
+            catch (error) {
+              if (fallbackContext) nativeQuestions.delete(input.messageId);
+              throw error;
+            }
             // Mark a synchronous rejection as observed while releasing the ordering barrier.
             Promise.resolve(receipt).catch(() => {});
           };
@@ -200,7 +239,15 @@ export async function startPlugin(ctx, makeClient, downloadImage = fetch) {
           finally { if (run.preparing.get(input.peer) === queued) run.preparing.delete(input.peer); }
         } else receipt = run.handle.receive(input, { signal });
         if (!receipt) return;
-        const result = await receipt;
+        let result;
+        try { result = await receipt; }
+        finally {
+          if (fallbackContext && nativeQuestions.get(input.messageId) === fallbackContext) nativeQuestions.delete(input.messageId);
+        }
+        if (input.images && result.status === 'generation_failed' && !result.duplicate && !signal.aborted) {
+          await sendImageStatus(current.imageModel ? '本次主模型未能完成看图，请稍后重发或切到「始终转述」。'
+            : '本次主模型未能完成看图。可选择辅助识图模型，以便主模型明确不支持图片时转述。');
+        }
         if (result.status !== 'sent' && !signal.aborted)
           ctx.logger.warn('Discord 消息未完成', { messageId: input.messageId, status: result.status });
       }
@@ -248,8 +295,14 @@ export async function startPlugin(ctx, makeClient, downloadImage = fetch) {
 
   ctx.effect(() => scheduleReceiptCleanup(ctx));
   ctx.effect(() => stop);
+  const connectionState = () => ({
+    status: [status, active?.commandNotice].filter(Boolean).join(' · '), lastError,
+    online: status === '已连接', enabled: config.enabled,
+    account: active?.account || '', canBind: Boolean(active?.handle && config.owner)
+  });
   setupPage(ctx, {
-    state: () => ({ config, lastError, status: [status, active?.commandNotice].filter(Boolean).join(' · '), account: active?.account || '', personas: ctx.personas.list(), imageModels: ctx.models.list('chat').filter(m => m.callable) }),
+    connectionState,
+    state: () => ({ config, ...connectionState(), personas: ctx.personas.list(), imageModels: ctx.models.list('chat').filter(m => m.callable) }),
     reconnect: revision => serial(async () => {
       if (revision !== config.revision) throw Error('配置已变更，请刷新后再连接。');
       if (!config.enabled) throw Error('请先启用并保存 Discord 连接。');
@@ -259,7 +312,7 @@ export async function startPlugin(ctx, makeClient, downloadImage = fetch) {
     save: (revision, fields) => serial(async () => {
       if (revision !== config.revision) throw Error('配置已变更，请刷新后再保存。');
       const next = validate({ ...fields, imageLimitsMiB:config.imageLimitsMiB, pausedRoutes: config.pausedRoutes, token: fields.token || config.token, revision: randomUUID() });
-      if (next.imageModel && !ctx.models.list('chat').some(m => m.id === next.imageModel && m.callable))
+      if (next.imageMode !== 'off' && next.imageModel && !ctx.models.list('chat').some(m => m.id === next.imageModel && m.callable))
         throw Error('请选择已启用、支持图像输入的对话模型。');
       if (!ctx.personas.list().some(p => p.id === next.persona)) throw Error('请选择已存在的人格。');
       await ctx.config.save('config.json', next);

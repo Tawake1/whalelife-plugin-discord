@@ -289,3 +289,51 @@ test('自定义上限覆盖上传记录、响应头与流，等于上限的图�
   assert.match(notices[0], /图1、图3超过 2.5 MiB（当前模型的单图上限）/);
   assert.deepEqual(f.calls[0].messages[1].content.filter(p=>p.type==='text').slice(1).map(p=>p.text), ['图2']);
 });
+
+test('自动模式按原始图号直传、转述及提示超限，重复投递核验原图', async () => {
+  const f = fixture();
+  const mib = 1024 * 1024;
+  const sizes = [4 * mib, 4 * mib + 1, 8 * mib + 1];
+  const images = sizes.map((size, i) => ({...attachment, size, url:prefix+i+'.png'}));
+  const fetched = [];
+  const notices = [];
+  Object.assign(f.args, {direct:true, limitMiB:8, images, sendAttachmentNotice:async text => notices.push(text),
+    download:async url => {
+      const position = Number(url.pathname.split('/').pop().split('.')[0]);
+      fetched.push(position);
+      return new Response(Buffer.concat([png], sizes[position]));
+    }});
+  const first = await imageNote(f.args);
+  assert.deepEqual(first.native.map(p => [p.number,p.image.mimeType,p.image.data.length]), [[1,'image/png',4*mib]]);
+  assert.match(first.note,/原图依次是图1/);
+  assert.match(first.note,/【图片转述】/);
+  assert.match(notices[0],/图3超过 8 MiB/);
+  assert.deepEqual(f.calls[0].messages[1].content.filter(p => p.type === 'text').slice(1).map(p => p.text), ['图2']);
+  assert.doesNotMatch(JSON.stringify([...f.state.values()]), /base64|cdn\.discordapp/);
+  const replay = await imageNote(f.args);
+  assert.equal(replay.note, first.note);
+  assert.deepEqual(replay.native, first.native);
+  assert.deepEqual(fetched, [0,1,0]);
+  assert.equal(f.calls.length, 1);
+  assert.equal(notices.length, 1);
+  f.args.download = async () => new Response(png);
+  assert.equal((await imageNote(f.args)).retryable, true);
+});
+
+test('纯原图不添加占位文字，辅助模型失败仍直传同条可用图片', async () => {
+  const f = fixture();
+  f.args.direct = true;
+  let result = await imageNote(f.args);
+  assert.equal(result.note,'');
+  assert.equal(result.native.length,1);
+  assert.equal(f.calls.length,0);
+  f.state.clear();
+  f.args.images.push({...attachment, url:prefix+'large.png'});
+  f.args.limitMiB = 8;
+  f.args.download = async url => new Response(url.pathname.endsWith('large.png') ? Buffer.concat([png], 5*1024*1024) : png);
+  f.args.ctx.llm.chat = async () => {throw Error('model unavailable')};
+  result = await imageNote(f.args);
+  assert.match(result.note,/图2转述失败/);
+  assert.equal(result.retryable,false);
+  assert.equal(result.native.length,1);
+});
